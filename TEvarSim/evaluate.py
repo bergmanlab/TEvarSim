@@ -467,6 +467,42 @@ def alleles_overlap(truth_descs, pred_descs, tol):
     return False
 
 
+# A matched call's ALTs within this many bp of the best match to the event still count as the event's allele:
+# the same element written twice, once per flanking variant, differs from itself by a few bases at most.
+EVENT_ALT_SLACK = 10
+
+
+def event_alt_indices(event, match, tol):
+    '''
+    Which of a multi-allelic call's ALTs are the simulated event's allele.
+
+    A record with several ALTs describes several alleles at one site, and a genome holding one of them does not
+    thereby hold the event: where two insertions' target sites overlap, a genome carrying only the neighbour has a
+    non-reference allele across the event's site, and the caller rightly writes it as a second ALT. Only an ALT
+    that is the event's own allele makes its genome a carrier -- for each of the event's alleles, the ALT closest
+    to it in length, and any other within EVENT_ALT_SLACK bp of that one and within
+    ``tol``. Returns None -- every non-reference allele carries the event, as before -- for a single-ALT record,
+    or where alleles cannot be compared by length (symbolic ALTs).
+    '''
+    if not match.alts or len(match.alts) <= 1:
+        return None
+    # By ALT index, as genotypes name them: the record's alt_descs leave out <*>, which shifts every index after it.
+    descs = resolve_alleles(match.ref, match.alts, tuple(range(1, len(match.alts) + 1))) or ()
+    alts = [(d.idx, d) for d in descs if d.idx not in match.nonvariant]
+    if len(alts) <= 1 or not event.alt_descs:
+        return None
+    if any(d.symbolic or d.size is None for _, d in alts) or \
+            any(t.symbolic or t.size is None for t in event.alt_descs):
+        return None
+    keep = set()
+    for t in event.alt_descs:
+        best = min(abs(d.size - t.size) for _, d in alts)
+        if best > tol:
+            continue
+        keep |= {i for i, d in alts if abs(d.size - t.size) <= min(tol, best + EVENT_ALT_SLACK)}
+    return keep
+
+
 def best_length_error(truth_descs, pred_descs):
     '''
     The smallest length disagreement between any pair of truth and predicted alleles, i.e.
@@ -616,6 +652,7 @@ def score_event(event, pairs, tol):
     tp = fp = fn = 0
     compared = concordant = 0
     by_class = OrderedDict((cls, _blank_counts()) for cls in ALLELE_CLASSES)
+    event_alts = event_alt_indices(event, match, tol) if match is not None else None
     untyped = []
     for tsample, psample in pairs:
         t_gt = event.gts.get(tsample, (None,))
@@ -628,6 +665,8 @@ def score_event(event, pairs, tol):
         else:
             p_gt = match.gts.get(psample, (None,))
             p_carrier = is_carrier(p_gt, match.nonvariant)
+            if p_carrier and event_alts is not None:
+                p_carrier = any(a in event_alts for a in p_gt if a is not None)
             typed = any(a is not None for a in p_gt)
             if p_carrier:
                 pred_carriers.append(psample)

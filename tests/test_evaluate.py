@@ -863,6 +863,43 @@ def test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp():
     print("PASS test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp")
 
 
+OTHER = "CATTAG" * 500             # 3000 bp: a different element, far from ELEMENT's length
+
+
+def test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier():
+    """Two insertions whose target sites overlap: a genome with only the neighbour has a non-reference allele
+    across this event's site, written as a second ALT. It does not carry this event."""
+    samples = ["S0", "S1", "S2"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["2", "1", "0"])])
+        assert _counts(ev, "carrier") == (1, 1, 1, 0, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (2, 2, 2, 0, 0), _counts(ev, "noncarrier")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+    print("PASS test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier")
+
+
+def test_the_same_element_written_as_two_alts_still_carries_the_event():
+    """One element, two ALTs that differ by a flanking SNP: both are the event's allele."""
+    samples = ["S0", "S1"]
+    snp = ANCHOR + ELEMENT[:-1] + ("C" if ELEMENT[-1] != "C" else "G")
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT, snp], ".", ["1", "2"])])
+        assert _counts(ev, "carrier") == (2, 2, 2, 0, 0), _counts(ev, "carrier")
+    print("PASS test_the_same_element_written_as_two_alts_still_carries_the_event")
+
+
+def test_a_no_variant_alt_does_not_shift_which_alt_is_the_event():
+    samples = ["S0", "S1", "S2"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["0", "1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, ["<*>", ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["1", "3", "2"])])
+        assert _counts(ev, "carrier") == (1, 1, 1, 0, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (2, 2, 2, 0, 0), _counts(ev, "noncarrier")
+    print("PASS test_a_no_variant_alt_does_not_shift_which_alt_is_the_event")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -916,3 +953,6 @@ if __name__ == "__main__":
     test_a_missed_locus_leaves_every_allele_ungenotyped()
     test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps()
     test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp()
+    test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier()
+    test_the_same_element_written_as_two_alts_still_carries_the_event()
+    test_a_no_variant_alt_does_not_shift_which_alt_is_the_event()
