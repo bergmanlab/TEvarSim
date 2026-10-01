@@ -672,7 +672,7 @@ def test_the_printed_report_names_the_headline_numbers():
             _evaluate(d, samples, [_ins(1000, ["1", "1"])], samples,
                       [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1"])])
         out = buf.getvalue()
-        for expected in ("Locus detection", "recovered", "By event type", "By TE family",
+        for expected in ("Locus detection", "recall", "By event type", "By TE family",
                          "By event size", "By allele frequency", "haplotype concordance"):
             assert expected in out, (expected, out)
     print("PASS test_the_printed_report_names_the_headline_numbers")
@@ -792,6 +792,77 @@ def test_an_empty_prediction_scores_zero_without_dividing_by_zero():
     print("PASS test_an_empty_prediction_scores_zero_without_dividing_by_zero")
 
 
+# ---- counts by locus and by allele -------------------------------------------
+
+
+def _counts(ev, key):
+    c = ev.summary["overall"]["counts"][key]
+    return (c["total"], c["genotyped"], c["tp"], c["fp"], c["fn"])
+
+
+def test_each_allele_class_is_scored_as_the_positive_class_in_turn():
+    """A noncarrier called a carrier is a carrier FP and a noncarrier FN; a carrier called a
+    noncarrier the other way round. "all" sums the classes."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "0", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0", "1", "0"])])
+        assert _counts(ev, "carrier") == (2, 2, 1, 1, 1), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (2, 2, 1, 1, 1), _counts(ev, "noncarrier")
+        assert _counts(ev, "all") == (4, 4, 2, 2, 2), _counts(ev, "all")
+        c = ev.summary["overall"]["counts"]["carrier"]
+        assert (c["recall"], c["precision"], c["f1"]) == (0.5, 0.5, 0.5), c
+    print("PASS test_each_allele_class_is_scored_as_the_positive_class_in_turn")
+
+
+def test_a_missing_genotype_is_an_fn_of_its_class_and_an_fp_of_neither():
+    """A "." is no call: before this, a carrier genotyped "." read as a noncarrier call."""
+    samples = ["S0", "S1", "S2"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", ".", "."])])
+        assert _counts(ev, "carrier") == (2, 1, 1, 0, 1), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (1, 0, 0, 0, 1), _counts(ev, "noncarrier")
+        assert ev.loci[0]["alleles"]["untyped"] == ["S1", "S2"], ev.loci[0]["alleles"]
+    print("PASS test_a_missing_genotype_is_an_fn_of_its_class_and_an_fp_of_neither")
+
+
+def test_a_missed_locus_leaves_every_allele_ungenotyped():
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"])], samples,
+                    [(9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1"])])
+        assert _counts(ev, "loci") == (1, 0, 0, 1, 1), _counts(ev, "loci")
+        assert _counts(ev, "carrier") == (1, 0, 0, 1, 1), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (1, 0, 0, 0, 1), _counts(ev, "noncarrier")
+    print("PASS test_a_missed_locus_leaves_every_allele_ungenotyped")
+
+
+def test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps():
+    """Evaluate's per-locus carrier FP cannot see them; the run's counts do."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"]),
+                     (9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1"])])
+        assert _counts(ev, "loci") == (1, 1, 1, 1, 0), _counts(ev, "loci")
+        assert _counts(ev, "carrier") == (1, 1, 1, 2, 0), _counts(ev, "carrier")
+        assert ev.summary["overall"]["carriers"]["fp"] == 0, "the per-locus carrier block is unchanged"
+        # a stratum has no locus FPs to count
+        row = ev.summary["by_event_type"]["INS"]["counts"]["loci"]
+        assert row["fp"] is None and row["precision"] is None, row
+    print("PASS test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps")
+
+
+def test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp():
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, ["S0"], [_EXC + (["1"],)], ["S0"],
+                    [(5000 + _LTRLEN, "6.1", ANCHOR + ELEMENT, [ANCHOR + SOLO_LTR], ".", ["1"])])
+        assert _counts(ev, "loci") == (1, 1, 1, 0, 0), _counts(ev, "loci")
+        assert _counts(ev, "carrier") == (1, 0, 0, 0, 1), _counts(ev, "carrier")
+    print("PASS test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -840,3 +911,8 @@ if __name__ == "__main__":
     test_a_contig_name_unsafe_in_a_filename_is_sanitised()
     test_a_bed_prediction_scores_detection_only()
     test_an_empty_prediction_scores_zero_without_dividing_by_zero()
+    test_each_allele_class_is_scored_as_the_positive_class_in_turn()
+    test_a_missing_genotype_is_an_fn_of_its_class_and_an_fp_of_neither()
+    test_a_missed_locus_leaves_every_allele_ungenotyped()
+    test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps()
+    test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp()

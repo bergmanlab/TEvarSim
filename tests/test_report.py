@@ -218,7 +218,7 @@ def test_the_size_table_names_the_missed_loci_apart_from_the_recovered_ones():
                     samples,
                     [(1000, "p1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1"])])
         page = _render(ev)
-        table = re.search(r"Recovery by event size.*?</details>", page, re.S).group(0)
+        table = re.search(r"Recall by event size.*?</details>", page, re.S).group(0)
         cells = [re.sub(r"<[^>]+>", "", cell)
                  for cell in re.findall(r'<td class=ids>(.*?)</td>', table)]
         assert cells == ["correctly placed: chrT:1000; missed: chrT:5000"], cells
@@ -541,10 +541,10 @@ def test_the_page_names_the_headline_numbers():
                     [(1000, "p1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1"]),
                      (5000, "p2", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"])])
         page = _render(ev)
-        assert "66.7%" in page, "the recovery rate is the hero figure"
+        assert "66.7%" in page, "the locus recall is the hero figure"
         assert "Breakpoint resolution" in page
         assert "Allele length accuracy" in page
-        assert "Recovery by event size" in page
+        assert "Recall by event size" in page
         assert "--max_dist 100" in page
         assert "S0" in page, "the paired genomes are named"
     print("PASS test_the_page_names_the_headline_numbers")

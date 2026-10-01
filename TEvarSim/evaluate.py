@@ -615,6 +615,8 @@ def score_event(event, pairs, tol):
     truth_carriers, pred_carriers = [], []
     tp = fp = fn = 0
     compared = concordant = 0
+    by_class = OrderedDict((cls, _blank_counts()) for cls in ALLELE_CLASSES)
+    untyped = []
     for tsample, psample in pairs:
         t_gt = event.gts.get(tsample, (None,))
         t_carrier = is_carrier(t_gt, {0})
@@ -622,9 +624,11 @@ def score_event(event, pairs, tol):
             truth_carriers.append(tsample)
         if match is None:
             p_carrier = False
+            typed = False
         else:
             p_gt = match.gts.get(psample, (None,))
             p_carrier = is_carrier(p_gt, match.nonvariant)
+            typed = any(a is not None for a in p_gt)
             if p_carrier:
                 pred_carriers.append(psample)
             # A genotype is only comparable where a prediction record describes the locus.
@@ -639,6 +643,23 @@ def score_event(event, pairs, tol):
         tp += t_carrier and p_carrier
         fp += (not t_carrier) and p_carrier
         fn += t_carrier and (not p_carrier)
+        # The same genome scored by allele class. A genome no correctly placed call
+        # genotypes -- the locus was missed or displaced, or the call says "." -- has no
+        # allele here at all: an FN of its own class and an FP of neither.
+        t_cls = "carrier" if t_carrier else "noncarrier"
+        counts = by_class[t_cls]
+        counts["total"] += 1
+        if not typed:
+            counts["fn"] += 1
+            untyped.append(tsample)
+            continue
+        counts["genotyped"] += 1
+        p_cls = "carrier" if p_carrier else "noncarrier"
+        if p_cls == t_cls:
+            counts["tp"] += 1
+        else:
+            counts["fn"] += 1
+            by_class[p_cls]["fp"] += 1
 
     # Allele frequency is a property of the simulation, so it is read off every genome the
     # truth VCF holds -- not only the ones that could be paired with a prediction.
@@ -695,6 +716,7 @@ def score_event(event, pairs, tol):
         ("tp", tp), ("fp", fp), ("fn", fn),
     ])
     scored["genotypes"] = OrderedDict([("compared", compared), ("concordant", concordant)])
+    scored["alleles"] = OrderedDict(list(by_class.items()) + [("untyped", untyped)])
     return scored
 
 
@@ -723,6 +745,58 @@ def _spread(values):
     ])
 
 
+# The two classes each paired genome's allele at a locus is scored as, by what the truth says
+# it holds there. For a deletion the carrier is the genome that LACKS the reference's element.
+ALLELE_CLASSES = ("carrier", "noncarrier")
+
+
+def _blank_counts():
+    return OrderedDict([("total", 0), ("genotyped", 0), ("tp", 0), ("fp", 0), ("fn", 0)])
+
+
+def with_rates(counts):
+    '''
+    Add recall, precision and F1 to a block of confusion counts. Precision and F1 are left
+    out (None) where FP is: a breakdown row has no locus FPs, since a call on no simulated
+    locus belongs to no stratum.
+    '''
+    out = OrderedDict(counts)
+    tp, fp, fn = out["tp"], out["fp"], out["fn"]
+    out["recall"] = round(tp / (tp + fn), 4) if tp + fn else None
+    if fp is None:
+        out["precision"] = out["f1"] = None
+    else:
+        f1, precision, _ = calculate_metrics(tp, fp, fn)
+        out["precision"] = round(precision, 4) if tp + fp else None
+        out["f1"] = round(f1, 4) if tp + fp and tp + fn else None
+    return out
+
+
+def counts_block(n_loci, n_recalled, allele_counts, locus_fp=None):
+    '''
+    TP, FP, FN, recall, precision and F1 by locus and by allele.
+
+    By locus: a simulated locus a call was placed on (displaced or not) is a TP, one with no
+    call an FN; an FP is a call on no simulated locus, known only for the whole run.
+
+    By allele, over every paired genome at every simulated locus: each class in turn is the
+    positive one. TP is an allele genotyped as its own class; FN is one that was not --
+    genotyped as the other class, or never genotyped; FP is an allele of the other class
+    genotyped as this one. ``genotyped`` counts the alleles that got a genotype at all, so
+    recall is at most genotyped / total. "all" sums the two classes.
+    '''
+    loci = OrderedDict([("total", n_loci), ("genotyped", n_recalled), ("tp", n_recalled),
+                        ("fp", locus_fp), ("fn", n_loci - n_recalled)])
+    block = OrderedDict([("loci", with_rates(loci))])
+    total = _blank_counts()
+    for cls in ALLELE_CLASSES:
+        for key in total:
+            total[key] += allele_counts[cls][key]
+        block[cls] = with_rates(allele_counts[cls])
+    block["all"] = with_rates(total)
+    return block
+
+
 def aggregate(scored_events):
     '''Roll a list of scored events up into one block of metrics.'''
     n = len(scored_events)
@@ -740,13 +814,19 @@ def aggregate(scored_events):
     # Signed, both of them: pos_offset is the call's position minus the simulated one and
     # length_error the called allele's length minus the simulated one, so short reads
     # negative and long reads positive.
+    allele_counts = {cls: _blank_counts() for cls in ALLELE_CLASSES}
+    for e in scored_events:
+        for cls in ALLELE_CLASSES:
+            for key, value in e["alleles"][cls].items():
+                allele_counts[cls][key] += value
     offsets = [e["match"]["pos_offset"] for e in detected]
     errors = [e["match"]["length_error"] for e in detected
               if e["match"]["length_error"] is not None]
     return OrderedDict([
         ("n_loci", n),
         ("n_recovered", recovered),
-        ("recovery_rate", round(recovered / n, 4) if n else None),
+        ("recall", round(recovered / n, 4) if n else None),
+        ("recovery_rate", round(recovered / n, 4) if n else None),   # = recall; the old name
         ("n_detected", len(detected)),
         ("n_displaced", len(displaced)),
         ("n_allele_concordant", allele_ok),
@@ -764,7 +844,24 @@ def aggregate(scored_events):
             ("concordant", concordant),
             ("concordance", round(concordant / compared, 4) if compared else None),
         ])),
+        ("counts", counts_block(n, recovered, allele_counts)),
     ])
+
+
+def add_unmatched(counts, unmatched_records):
+    '''
+    Charge the calls that matched no simulated locus to the run's counts: each is a locus
+    FP, and each genome it calls a carrier a carrier FP. A displaced call is left out of
+    both -- its locus is already counted as recalled, and its genomes as not genotyped.
+    '''
+    spurious = [r for r in unmatched_records if r.displaced_for is None]
+    carriers = sum(1 for r in spurious for gt in r.gts.values() if is_carrier(gt, r.nonvariant))
+    counts["loci"]["fp"] = len(spurious)
+    counts["loci"].update(with_rates(counts["loci"]))
+    counts["carrier"]["fp"] += carriers
+    counts["carrier"].update(with_rates(counts["carrier"]))
+    counts["all"]["fp"] += carriers
+    counts["all"].update(with_rates(counts["all"]))
 
 
 def stratify(scored_events, key):
@@ -866,13 +963,29 @@ def _stratum_rows(strata):
             stats["n_loci"],
             stats["n_recovered"],
             stats["n_displaced"],
-            _pct(stats["recovery_rate"]),
+            _pct(stats["recall"]),
             _pct(stats["allele_concordance_rate"]),
             _signed(stats["breakpoint_offset_bp"]["mean"]),
             _signed(stats["allele_length_error_bp"]["mean"]),
-            _num(stats["carriers"]["f1"]),
+            _num(stats["counts"]["carrier"]["f1"]),
+            _num(stats["counts"]["noncarrier"]["f1"]),
+            _num(stats["counts"]["all"]["f1"]),
             _pct(stats["genotypes"]["concordance"]),
         ])
+    return rows
+
+
+COUNT_HEADERS = ["level", "total", "called", "TP", "FP", "FN", "recall", "precision", "F1"]
+
+
+def count_rows(counts, unit="haplotype"):
+    '''Rows of the locus and allele table: loci, then carrier, noncarrier and all alleles.'''
+    rows = []
+    for key, label in (("loci", "loci"), ("carrier", f"carrier {unit}s"),
+                       ("noncarrier", f"noncarrier {unit}s"), ("all", f"all {unit}s")):
+        c = counts[key]
+        rows.append([label, c["total"], c["genotyped"], c["tp"], _num(c["fp"]), c["fn"],
+                     _num(c["recall"]), _num(c["precision"]), _num(c["f1"])])
     return rows
 
 
@@ -882,8 +995,9 @@ def stratum_headers(unit="loci"):
     actually hold: every table counts loci except the event-type one, where a locus is
     counted under each event class in its history and the column therefore counts events.
     '''
-    return ["stratum", unit, "found", "displ", "recovery",
-            "allele ok", "mean off", "mean len err", "carrier F1", "genotype"]
+    return ["stratum", unit, "found", "displ", "recall",
+            "allele ok", "mean off", "mean len err", "carrier F1", "noncarr F1", "all F1",
+            "genotype"]
 
 
 def format_report(summary, meta):
@@ -915,8 +1029,8 @@ def format_report(summary, meta):
     overall = summary["overall"]
     lines.append("")
     lines.append(f"Locus detection ({overall['n_loci']} simulated loci)")
-    lines.append(f"  recovered            : {overall['n_recovered']} / {overall['n_loci']}"
-                 f"  ({_pct(overall['recovery_rate'])})")
+    lines.append(f"  recall               : {overall['n_recovered']} / {overall['n_loci']}"
+                 f"  ({_pct(overall['recall'])})")
     if overall["n_displaced"]:
         lines.append(f"    correctly placed   : {overall['n_detected']}")
         lines.append(f"    displaced          : {overall['n_displaced']}"
@@ -935,27 +1049,27 @@ def format_report(summary, meta):
     offsets = overall["breakpoint_offset_bp"]
     errors = overall["allele_length_error_bp"]
     lines.append("")
-    lines.append("Accuracy of the recovered loci")
+    lines.append("Accuracy of the recalled loci")
     lines.append(f"  breakpoint offset   : mean {_signed(offsets['mean'])} bp, "
                  f"SD {_num(offsets['sd'])} bp   (n={offsets['n']})")
     lines.append(f"  allele length error : mean {_signed(errors['mean'])} bp, "
                  f"SD {_num(errors['sd'])} bp   (n={errors['n']})")
     lines.append("  (- is short of the simulated value, + is past it)")
 
-    carriers = overall["carriers"]
     genotypes = overall["genotypes"]
     lines.append("")
     if meta["sample_pairs"]:
-        lines.append(f"Carrier accuracy over {len(meta['sample_pairs'])} paired genomes "
-                     f"({carriers['tp'] + carriers['fn']} simulated carrier genomes)")
-        lines.append(f"  TP {carriers['tp']}, FP {carriers['fp']}, FN {carriers['fn']}")
-        lines.append(f"  recall {carriers['recall']:.4f}, "
-                     f"precision {carriers['precision']:.4f}, F1 {carriers['f1']:.4f}")
-        lines.append(f"  {meta['genotype_label']} concordance: "
+        unit = meta["genotype_label"]
+        lines.append(f"By locus and by {unit}, over {len(meta['sample_pairs'])} paired genomes")
+        lines.extend(_table(COUNT_HEADERS, count_rows(overall["counts"], unit)))
+        lines.append(f"  a {unit} with no genotype (missed or displaced locus, or \".\") is an FN of "
+                     "its own class and an FP of neither;")
+        lines.append("  the carriers of a call on no simulated locus are carrier FPs")
+        lines.append(f"  {unit} concordance: "
                      f"{genotypes['concordant']} / {genotypes['compared']} "
                      f"({_pct(genotypes['concordance'])})")
     else:
-        lines.append("Carrier accuracy: not available (no genomes paired)")
+        lines.append("Allele accuracy: not available (no genomes paired)")
 
     unsupported = summary.get("unsupported_events") or []
     if unsupported:
@@ -1039,6 +1153,7 @@ class Evaluator:
 
         summary = OrderedDict()
         summary["overall"] = aggregate(scored)
+        add_unmatched(summary["overall"]["counts"], unmatched_records)
         # A displaced call stays unmatched: it found a locus but put the breakpoint a
         # whole solo LTR away, so it is not a correct prediction and precision must not
         # credit it. Counted separately so it is not read as a spurious call either.

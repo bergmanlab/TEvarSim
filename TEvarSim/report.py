@@ -510,7 +510,7 @@ def stratum_bars(strata, series):
     plot_top = _PAD_T + 4
     height = plot_top + len(strata) * group_h + 20
 
-    out = [_svg_open(_CHART_W, height, "Recovery and accuracy by stratum")]
+    out = [_svg_open(_CHART_W, height, "Recall and accuracy by stratum")]
     for fraction in (0, 0.25, 0.5, 0.75, 1.0):
         x = plot_l + fraction * plot_w
         out.append(f'<line class="grid" x1="{_r(x)}" y1="{plot_top - 4}" '
@@ -586,10 +586,56 @@ def _details(summary_text, body):
             f'{body}</details>')
 
 
+def _recall(stats):
+    '''Locus recall; an Evaluate JSON from before it was named that has only recovery_rate.'''
+    return stats.get("recall", stats.get("recovery_rate"))
+
+
+def _f1(stats, cls):
+    '''An allele class's F1, from the counts block, or the old carrier F1 where there is none.'''
+    counts = stats.get("counts")
+    if counts:
+        return counts[cls]["f1"]
+    return stats["carriers"]["f1"] if cls == "carrier" else None
+
+
+COUNT_HEADERS = ["level", "total", "called", "TP", "FP", "FN", "recall", "precision", "F1"]
+
+
+def counts_rows(counts, unit):
+    rows = []
+    for key, label in (("loci", "loci"), ("carrier", f"carrier {unit}s"),
+                       ("noncarrier", f"noncarrier {unit}s"), ("all", f"all {unit}s")):
+        c = counts[key]
+        rows.append([label, c["total"], c["genotyped"], c["tp"], _num(c["fp"]), c["fn"],
+                     _num(c["recall"]), _num(c["precision"]), _num(c["f1"])])
+    return rows
+
+
+def _counts_section(summary, meta):
+    counts = summary["overall"].get("counts")
+    if not counts or not meta.get("sample_pairs"):
+        return ""
+    unit = meta.get("genotype_label", "genotype")
+    return (
+        '<section class="card"><h2>By locus and by ' + _esc(unit) + '</h2>'
+        f'<p class="sub">Over {len(meta["sample_pairs"])} paired genomes. Each allele class is '
+        'the positive class in turn; "all" sums the two.</p>'
+        + _table(COUNT_HEADERS, counts_rows(counts, unit))
+        + '<p class="note">A locus is a TP when a call was placed on it and an FN when none was; a '
+        'call on no simulated locus is a locus FP. A ' + _esc(unit) + ' is a TP when genotyped as '
+        'its own class, an FN when genotyped as the other class or never genotyped (missed or '
+        'displaced locus, or a "." genotype), and an FP of the class it was wrongly genotyped as; '
+        'one never genotyped is an FP of neither. The carriers of a call on no simulated locus are '
+        'carrier FPs. "called" is the loci recalled and the ' + _esc(unit) + 's that got a '
+        'genotype.</p></section>')
+
+
 def stratum_rows(strata, unit):
     '''The breakdown table, with the same columns the text report prints.'''
-    headers = ["stratum", unit, "found", "displaced", "recovery", "allele ok",
-               "mean offset", "mean length err", "carrier F1", "genotype"]
+    headers = ["stratum", unit, "found", "displaced", "recall", "allele ok",
+               "mean offset", "mean length err", "carrier F1", "noncarrier F1", "all F1",
+               "genotype"]
     rows = []
     for label, stats in strata.items():
         rows.append([
@@ -597,11 +643,13 @@ def stratum_rows(strata, unit):
             stats["n_loci"],
             stats["n_recovered"],
             stats["n_displaced"],
-            _pct(stats["recovery_rate"]),
+            _pct(_recall(stats)),
             _pct(stats["allele_concordance_rate"]),
             _signed(stats["breakpoint_offset_bp"]["mean"]),
             _signed(stats["allele_length_error_bp"]["mean"]),
-            _num(stats["carriers"]["f1"]),
+            _num(_f1(stats, "carrier")),
+            _num(_f1(stats, "noncarrier")),
+            _num(_f1(stats, "all")),
             _pct(stats["genotypes"]["concordance"]),
         ])
     return headers, rows
@@ -1071,8 +1119,8 @@ def _headline(summary, meta):
 
     hero = (
         '<section class="card hero">'
-        f'<div class="figure">{_esc(_pct(overall["recovery_rate"]))}</div>'
-        f'<div class="caption">of the {overall["n_loci"]} simulated loci were recovered'
+        f'<div class="figure">{_esc(_pct(_recall(overall)))}</div>'
+        f'<div class="caption">locus recall over the {overall["n_loci"]} simulated loci'
         f' &mdash; {overall["n_recovered"]} found, '
         f'{overall["n_loci"] - overall["n_recovered"]} missed</div>'
         '</section>'
@@ -1092,8 +1140,9 @@ def _headline(summary, meta):
               f'mean ± SD over n={overall["allele_length_error_bp"]["n"]}'),
     ]
     if meta.get("sample_pairs"):
-        tiles.append(_tile("Carrier F1", _num(carriers["f1"]),
-                           f'TP {carriers["tp"]}, FP {carriers["fp"]}, FN {carriers["fn"]}'))
+        c = overall.get("counts", {}).get("carrier") or carriers
+        tiles.append(_tile("Carrier F1", _num(c["f1"]),
+                           f'TP {c["tp"]}, FP {c["fp"]}, FN {c["fn"]}'))
         tiles.append(_tile(f"{label.capitalize()} concordance",
                            _pct(genotypes["concordance"]),
                            f'{genotypes["concordant"]} of {genotypes["compared"]} compared'))
@@ -1213,7 +1262,7 @@ def _size_section(loci, labels):
                  "to place on this axis.")
     return (
         '<section class="card">'
-        '<h2>Recovery by event size</h2>'
+        '<h2>Recall by event size</h2>'
         f'<p class="sub">Every simulated locus, at the size it was simulated at, split by '
         f'what the prediction made of it.</p>'
         f'{svg}'
@@ -1229,13 +1278,13 @@ def _size_section(loci, labels):
 
 
 def _strata_section(summary, meta):
-    metrics = [("recovery rate", "var(--series-1)", lambda s: s["recovery_rate"])]
+    metrics = [("locus recall", "var(--series-1)", _recall)]
     # With no genomes paired there are no carrier counts to score, and
     # ``calculate_metrics`` reports an F1 of 0 for the empty confusion matrix -- a bar
     # drawn from that would read as "the caller got every carrier wrong" rather than
     # "nothing was compared". The tables still carry the raw zeros, as the text report does.
     if meta.get("sample_pairs"):
-        metrics.append(("carrier F1", "var(--series-2)", lambda s: s["carriers"]["f1"]))
+        metrics.append(("carrier F1", "var(--series-2)", lambda s: _f1(s, "carrier")))
         metrics.append(("genotype concordance", "var(--series-3)",
                         lambda s: s["genotypes"]["concordance"]))
     out = []
@@ -1427,6 +1476,7 @@ def render(meta, summary, loci, locus_dir=None, summary_file=None,
     viewer = _viewer_section(truth_rows, pred_rows, meta)
     report = "\n".join(part for part in (
         _headline(summary, meta),
+        _counts_section(summary, meta),
         _breakpoint_section(loci, labels, meta),
         _length_section(loci, labels),
         _size_section(loci, labels),
