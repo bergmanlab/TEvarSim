@@ -467,40 +467,61 @@ def alleles_overlap(truth_descs, pred_descs, tol):
     return False
 
 
-# A matched call's ALTs within this many bp of the best match to the event still count as the event's allele:
-# the same element written twice, once per flanking variant, differs from itself by a few bases at most.
-EVENT_ALT_SLACK = 10
+def nearby_events(events, max_dist):
+    '''Each event's simulated neighbours: the other events on its contig within ``max_dist`` of it.'''
+    by_chrom = {}
+    for e in events:
+        by_chrom.setdefault(e.chrom, []).append(e)
+    out = {}
+    for chrom, group in by_chrom.items():
+        group.sort(key=lambda e: e.pos)
+        for i, e in enumerate(group):
+            near = []
+            for j in range(i - 1, -1, -1):
+                if e.pos - group[j].pos > max_dist:
+                    break
+                near.append(group[j])
+            for j in range(i + 1, len(group)):
+                if group[j].pos - e.pos > max_dist:
+                    break
+                near.append(group[j])
+            out[id(e)] = near
+    return out
 
 
-def event_alt_indices(event, match, tol):
+def _closest(size, descs):
+    sizes = [d.size for d in descs if not d.symbolic and d.size is not None]
+    return min((abs(size - s) for s in sizes), default=None)
+
+
+def holds_neighbour_instead(event, neighbours, tsample, p_descs):
     '''
-    Which of a multi-allelic call's ALTs are the simulated event's allele.
+    Whether a genome's allele in a multi-allelic call is a neighbouring event's rather than this one's.
 
-    A record with several ALTs describes several alleles at one site, and a genome holding one of them does not
-    thereby hold the event: where two insertions' target sites overlap, a genome carrying only the neighbour has a
-    non-reference allele across the event's site, and the caller rightly writes it as a second ALT. Only an ALT
-    that is the event's own allele makes its genome a carrier -- for each of the event's alleles, the ALT closest
-    to it in length, and any other within EVENT_ALT_SLACK bp of that one and within
-    ``tol``. Returns None -- every non-reference allele carries the event, as before -- for a single-ALT record,
-    or where alleles cannot be compared by length (symbolic ALTs).
+    Where two insertions' target sites overlap, a genome carrying only the neighbour has a non-reference allele
+    across this event's site, and a caller rightly writes it as a second ALT of this event's record. Every
+    non-reference allele used to count as carrying the event. Now an allele is this event's unless it is closer in
+    length to an event the genome really carries nearby -- so flank variation folded into the ALT (the same
+    element beside a SNP or a small deletion) still counts, and only another simulated allele takes it away.
     '''
-    if not match.alts or len(match.alts) <= 1:
-        return None
-    # By ALT index, as genotypes name them: the record's alt_descs leave out <*>, which shifts every index after it.
-    descs = resolve_alleles(match.ref, match.alts, tuple(range(1, len(match.alts) + 1))) or ()
-    alts = [(d.idx, d) for d in descs if d.idx not in match.nonvariant]
-    if len(alts) <= 1 or not event.alt_descs:
-        return None
-    if any(d.symbolic or d.size is None for _, d in alts) or \
-            any(t.symbolic or t.size is None for t in event.alt_descs):
-        return None
-    keep = set()
-    for t in event.alt_descs:
-        best = min(abs(d.size - t.size) for _, d in alts)
-        if best > tol:
-            continue
-        keep |= {i for i, d in alts if abs(d.size - t.size) <= min(tol, best + EVENT_ALT_SLACK)}
-    return keep
+    if not p_descs or not neighbours:
+        return False
+    sizes = [d.size for d in p_descs if d.idx != 0 and not d.symbolic and d.size is not None]
+    if not sizes:
+        return False
+    for size in sizes:
+        mine = _closest(size, event.alt_descs)
+        if mine is None:
+            return False
+        for n in neighbours:
+            if not is_carrier(n.gts.get(tsample, (None,)), {0}):
+                continue
+            theirs = _closest(size, n.alt_descs)
+            if theirs is not None and theirs < mine:
+                break
+        else:
+            return False            # this allele is best explained by the event itself
+    return True
 
 
 def best_length_error(truth_descs, pred_descs):
@@ -645,14 +666,15 @@ def match_ploidy(t_gt, t_descs, p_gt, p_descs):
     return t_gt, t_descs, p_gt, p_descs
 
 
-def score_event(event, pairs, tol):
+def score_event(event, pairs, tol, neighbours=()):
     '''Turn one simulated event and its matched prediction into a scored record.'''
     match = event.match
     truth_carriers, pred_carriers = [], []
     tp = fp = fn = 0
     compared = concordant = 0
     by_class = OrderedDict((cls, _blank_counts()) for cls in ALLELE_CLASSES)
-    event_alts = event_alt_indices(event, match, tol) if match is not None else None
+    multi = match is not None and \
+        len([a for a in (match.alts or ()) if a != "<*>"]) > 1
     untyped = []
     for tsample, psample in pairs:
         t_gt = event.gts.get(tsample, (None,))
@@ -665,8 +687,9 @@ def score_event(event, pairs, tol):
         else:
             p_gt = match.gts.get(psample, (None,))
             p_carrier = is_carrier(p_gt, match.nonvariant)
-            if p_carrier and event_alts is not None:
-                p_carrier = any(a in event_alts for a in p_gt if a is not None)
+            if p_carrier and multi and holds_neighbour_instead(event, neighbours, tsample,
+                                                               match.descs.get(psample)):
+                p_carrier = False
             typed = any(a is not None for a in p_gt)
             if p_carrier:
                 pred_carriers.append(psample)
@@ -1175,7 +1198,9 @@ class Evaluator:
 
         match_events(events, records, self.max_dist, self.gt_len_tol)
         ordered = sorted(events, key=lambda e: (e.chrom, e.pos))
-        scored = [score_event(event, pairs, self.gt_len_tol) for event in ordered]
+        near = nearby_events(events, self.max_dist)
+        scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
+                  for event in ordered]
         # Which record of the truth file each scored locus came from, in the same order.
         # Kept beside the scored loci rather than inside them: the report links a locus to
         # its record with it, and it is a fact about this file rather than about the locus,

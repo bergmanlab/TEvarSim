@@ -866,17 +866,32 @@ def test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp():
 OTHER = "CATTAG" * 500             # 3000 bp: a different element, far from ELEMENT's length
 
 
-def test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier():
+def _other(pos, gts):
+    return (pos, "TY2-FULL#LTR/Copia_2INDEL", ANCHOR, [ANCHOR + OTHER], "TYPE=INS;EVENTTYPE=INS", gts)
+
+
+def test_a_genome_holding_a_neighbours_alt_of_a_multiallelic_call_is_not_a_carrier():
     """Two insertions whose target sites overlap: a genome with only the neighbour has a non-reference allele
-    across this event's site, written as a second ALT. It does not carry this event."""
+    across this event's site, written as a second ALT of its record. It carries the neighbour, not this event."""
     samples = ["S0", "S1", "S2"]
     with tempfile.TemporaryDirectory() as d:
-        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0", "0"])], samples,
-                    [(1000, "1.1", ANCHOR, [ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["2", "1", "0"])])
-        assert _counts(ev, "carrier") == (1, 1, 1, 0, 0), _counts(ev, "carrier")
-        assert _counts(ev, "noncarrier") == (2, 2, 2, 0, 0), _counts(ev, "noncarrier")
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0", "0"]), _other(1004, ["0", "1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["2", "1", "0"]),
+                     (1004, "1.2", ANCHOR, [ANCHOR + OTHER], ".", ["0", "1", "0"])])
+        assert _counts(ev, "carrier") == (2, 2, 2, 0, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (4, 4, 4, 0, 0), _counts(ev, "noncarrier")
         assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
-    print("PASS test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier")
+    print("PASS test_a_genome_holding_a_neighbours_alt_of_a_multiallelic_call_is_not_a_carrier")
+
+
+def test_an_alt_no_simulated_neighbour_explains_still_carries_the_event():
+    """Flank variation folded into a second ALT -- the element beside a 200 bp deletion -- is still the event."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT, ANCHOR + ELEMENT[:-200]], ".", ["1", "2"])])
+        assert _counts(ev, "carrier") == (2, 2, 2, 0, 0), _counts(ev, "carrier")
+    print("PASS test_an_alt_no_simulated_neighbour_explains_still_carries_the_event")
 
 
 def test_the_same_element_written_as_two_alts_still_carries_the_event():
@@ -890,14 +905,14 @@ def test_the_same_element_written_as_two_alts_still_carries_the_event():
     print("PASS test_the_same_element_written_as_two_alts_still_carries_the_event")
 
 
-def test_a_no_variant_alt_does_not_shift_which_alt_is_the_event():
+def test_a_no_variant_alt_does_not_upset_the_neighbour_test():
     samples = ["S0", "S1", "S2"]
     with tempfile.TemporaryDirectory() as d:
-        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["0", "1", "0"])], samples,
-                    [(1000, "1.1", ANCHOR, ["<*>", ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["1", "3", "2"])])
-        assert _counts(ev, "carrier") == (1, 1, 1, 0, 0), _counts(ev, "carrier")
-        assert _counts(ev, "noncarrier") == (2, 2, 2, 0, 0), _counts(ev, "noncarrier")
-    print("PASS test_a_no_variant_alt_does_not_shift_which_alt_is_the_event")
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["0", "1", "0"]), _other(1004, ["1", "0", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, ["<*>", ANCHOR + OTHER, ANCHOR + ELEMENT], ".", ["2", "3", "1"]),
+                     (1004, "1.2", ANCHOR, [ANCHOR + OTHER], ".", ["1", "0", "0"])])
+        assert ev.loci[0]["carriers"]["predicted"] == ["S1"], ev.loci[0]["carriers"]
+    print("PASS test_a_no_variant_alt_does_not_upset_the_neighbour_test")
 
 
 if __name__ == "__main__":
@@ -953,6 +968,7 @@ if __name__ == "__main__":
     test_a_missed_locus_leaves_every_allele_ungenotyped()
     test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps()
     test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp()
-    test_a_genome_holding_another_alt_of_a_multiallelic_call_is_not_a_carrier()
+    test_a_genome_holding_a_neighbours_alt_of_a_multiallelic_call_is_not_a_carrier()
+    test_an_alt_no_simulated_neighbour_explains_still_carries_the_event()
     test_the_same_element_written_as_two_alts_still_carries_the_event()
-    test_a_no_variant_alt_does_not_shift_which_alt_is_the_event()
+    test_a_no_variant_alt_does_not_upset_the_neighbour_test()
