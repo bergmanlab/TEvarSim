@@ -346,7 +346,9 @@ def carrier_alleles(info_text, key, n_alts):
     The ALTs an INFO field marks as carrier alleles, for --carrier_info: a set of 1-based ALT indices.
 
     A field with one value per allele -- REF first (Number=R, like miniME's ME_INFO) or ALTs only (Number=A) --
-    marks each ALT by its own value, and "." (or empty) means that ALT is not a carrier allele. Any other field on a
+    marks each ALT by its own value, and "." (or empty) means that ALT is not a carrier allele -- unless the REF
+    value is itself marked: then the reference holds the element, the event is its absence (a deletion, whose
+    carriers are the genomes LACKING the element), and the carrier alleles are the ALTs marked ".". Any other field on a
     single-ALT record (GraffiTE's repeat_ids) marks that one ALT by being present and not ".". A record without the
     field has no carrier allele. None where a multi-ALT record's field cannot be read per allele, so the caller
     falls back to inferring it.
@@ -361,6 +363,8 @@ def carrier_alleles(info_text, key, n_alts):
         return set()
     values = value.split(",")
     if len(values) == n_alts + 1 and n_alts > 0:
+        if values[0] not in ("", "."):
+            return {i + 1 for i, v in enumerate(values[1:]) if v in ("", ".")}
         per = values[1:]
     elif len(values) == n_alts:
         per = values

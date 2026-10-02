@@ -951,6 +951,20 @@ def test_carrier_info_on_a_single_alt_record_is_presence():
     print("PASS test_carrier_info_on_a_single_alt_record_is_presence")
 
 
+def test_carrier_info_on_a_reference_held_element_marks_its_absence():
+    """A deletion: the reference holds the element (ME_INFO marks REF), the ALT is its absence, and the genomes
+    carrying that ALT are the deletion's carriers."""
+    samples = ["S0", "S1"]
+    deletion = (1000, "DEL-chrT-1000-6929-LTR/Copia-TY1-FULL", ANCHOR + ELEMENT, [ANCHOR],
+                "TYPE=DEL;EVENTTYPE=DEL", ["1", "0"])
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [deletion], samples,
+                    [(1000, "1.1", ANCHOR + ELEMENT, [ANCHOR], "ME_INFO=TY1,.", ["1", "0"])],
+                    carrier_info="ME_INFO")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+    print("PASS test_carrier_info_on_a_reference_held_element_marks_its_absence")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1011,3 +1025,4 @@ if __name__ == "__main__":
     test_a_small_variant_written_as_another_alt_does_not_carry_the_event()
     test_carrier_info_marks_which_alts_are_carrier_alleles()
     test_carrier_info_on_a_single_alt_record_is_presence()
+    test_carrier_info_on_a_reference_held_element_marks_its_absence()
