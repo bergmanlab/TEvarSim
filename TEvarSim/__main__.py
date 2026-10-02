@@ -330,6 +330,13 @@ def main():
     Evaluate_parser.add_argument("--gt_len_tol", type=int, default=50,
                     help="Maximum allowed difference (bp) in allele length to consider two "
                          "alleles as the same (default: 50)")
+    Evaluate_parser.add_argument("--reference", "-R", type=Fasta_File_Path, default=None,
+                    help="Reference FASTA the truth and prediction coordinates refer to (indexed, or in a "
+                         "writable directory). Adds a sequence check: each correctly placed call's allele is "
+                         "written into the reference and compared base-for-base (case-insensitive) with the "
+                         "simulated haplotype, so an anchor shifted along a TSD still matches. The usual report "
+                         "is followed by a second, sequence-exact one in which only identical calls count; it is "
+                         "also written to <outprefix>.exact.json and .exact.html.")
     Evaluate_parser.add_argument("--carrier_info", type=str, default=None, metavar="KEY",
                     help="INFO field of the prediction that marks which ALTs are carrier alleles. With one "
                          "value per allele (REF first, e.g. miniME's ME_INFO, or ALTs only), an ALT whose value "

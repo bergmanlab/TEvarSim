@@ -965,6 +965,108 @@ def test_carrier_info_on_a_reference_held_element_marks_its_absence():
     print("PASS test_carrier_info_on_a_reference_held_element_marks_its_absence")
 
 
+
+# ---- sequence check (--reference) ---------------------------------------------
+#
+# Evaluate otherwise compares alleles by length. --reference writes each allele into the
+# reference and compares the haplotypes, so a call anchored anywhere along a TSD still
+# matches, and a call of the right length with the wrong bases does not.
+
+TSD_POS = 8000      # truth POS: the ALT is anchor + element + the TSD that ends at POS
+TSD_LEN = 5
+
+
+def _reference(d, lower=None):
+    import random
+    rng = random.Random(7)
+    seq = "".join(rng.choice("ACGT") for _ in range(20000))
+    if lower:
+        a, b = lower
+        seq = seq[:a] + seq[a:b].lower() + seq[b:]
+    path = os.path.join(d, "ref.fa")
+    with open(path, "w") as f:
+        f.write(">chrT\n")
+        for i in range(0, len(seq), 60):
+            f.write(seq[i:i + 60] + "\n")
+    return path, seq
+
+
+def _truth_ins(seq, gts):
+    p = TSD_POS
+    tsd = seq[p - TSD_LEN:p]
+    return (p, "TY1-FULL#LTR/Copia_", seq[p - 1], [seq[p - 1] + ELEMENT + tsd], "TYPE=INS;EVENTTYPE=INS", gts)
+
+
+def _left_aligned_call(seq, gts, element=ELEMENT, keep_tsd=True):
+    q = TSD_POS - TSD_LEN
+    tsd = seq[TSD_POS - TSD_LEN:TSD_POS].upper()
+    alt = seq[q - 1] + (tsd if keep_tsd else "") + element
+    return (q, "call1", seq[q - 1], [alt], ".", gts)
+
+
+def test_a_call_anchored_before_the_tsd_is_haplotype_identical():
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [_left_aligned_call(seq, ["1", "0"])], reference=ref)
+        assert ev.loci[0]["match"]["pos_offset"] == -TSD_LEN
+        assert ev.loci[0]["match"]["haplotype_identical"] is True
+        assert ev.summary["overall"]["n_haplotype_identical"] == 1
+        assert ev.exact_summary["overall"]["n_recovered"] == 1
+        assert ev.exact_summary["predictions"]["unmatched"] == 0
+    print("PASS test_a_call_anchored_before_the_tsd_is_haplotype_identical")
+
+def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [_left_aligned_call(seq, ["1", "0"], keep_tsd=False)], reference=ref)
+        assert ev.summary["overall"]["n_recovered"] == 1           # within --gt_len_tol
+        assert ev.loci[0]["match"]["allele_match"] is True
+        assert ev.loci[0]["match"]["haplotype_identical"] is False
+        exact = ev.exact_summary
+        assert exact["overall"]["n_recovered"] == 0
+        assert exact["predictions"]["unmatched"] == 1
+        assert exact["overall"]["carriers"]["tp"] == 0 and exact["overall"]["carriers"]["fn"] == 1
+        # the usual evaluation is untouched by the second one
+        assert ev.summary["overall"]["carriers"]["tp"] == 1
+        with open(os.path.join(d, "out.json")) as f:
+            saved = json.load(f)
+        assert saved["summary"]["overall"]["n_recovered"] == 1
+        assert saved["summary_sequence_exact"]["overall"]["n_recovered"] == 0
+        assert os.path.exists(os.path.join(d, "out.exact.json"))
+    print("PASS test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence")
+
+def test_one_wrong_base_inside_the_element_is_not_identical():
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        mutated = ELEMENT[:3000] + ("C" if ELEMENT[3000] != "C" else "G") + ELEMENT[3001:]
+        ev = _quiet(_evaluate, d, ["g0"], [_truth_ins(seq, ["1"])],
+                    ["g0"], [_left_aligned_call(seq, ["1"], element=mutated)], reference=ref)
+        assert ev.loci[0]["match"]["haplotype_identical"] is False
+        assert ev.exact_summary["overall"]["n_recovered"] == 0
+    print("PASS test_one_wrong_base_inside_the_element_is_not_identical")
+
+def test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case():
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d, lower=(TSD_POS - 50, TSD_POS + 50))
+        truth = _truth_ins(seq, ["1"])
+        assert truth[3][0][-TSD_LEN:].islower()                   # the simulation copies masked bases
+        ev = _quiet(_evaluate, d, ["g0"], [truth], ["g0"], [_left_aligned_call(seq, ["1"])], reference=ref)
+        assert ev.loci[0]["match"]["haplotype_identical"] is True
+    print("PASS test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case")
+
+def test_without_a_reference_nothing_changes():
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        ev = _quiet(_evaluate, d, ["g0"], [_truth_ins(seq, ["1"])],
+                    ["g0"], [_left_aligned_call(seq, ["1"], keep_tsd=False)])
+        assert "haplotype_identical" not in ev.loci[0]["match"]
+        assert "n_haplotype_identical" not in ev.summary["overall"]
+        assert ev.exact_summary is None
+        assert not os.path.exists(os.path.join(d, "out.exact.json"))
+    print("PASS test_without_a_reference_nothing_changes")
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1026,3 +1128,8 @@ if __name__ == "__main__":
     test_carrier_info_marks_which_alts_are_carrier_alleles()
     test_carrier_info_on_a_single_alt_record_is_presence()
     test_carrier_info_on_a_reference_held_element_marks_its_absence()
+    test_a_call_anchored_before_the_tsd_is_haplotype_identical()
+    test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence()
+    test_one_wrong_base_inside_the_element_is_not_identical()
+    test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case()
+    test_without_a_reference_nothing_changes()

@@ -591,6 +591,70 @@ def best_length_error(truth_descs, pred_descs):
     return min(errors, key=abs)
 
 
+def _haplotype(fasta, chrom, start, end, pos, ref, allele):
+    '''
+    The sequence a genome carrying ``allele`` has over reference [start, end): the record's
+    REF span replaced by the allele. Upper-cased, because a simulated TSD copies soft-masked
+    (lower-case) reference bases while callers write them in upper case -- the same bases.
+    '''
+    return (fasta.fetch(chrom, start, pos - 1) + allele
+            + fasta.fetch(chrom, pos - 1 + len(ref), end)).upper()
+
+
+def haplotype_identical(event, match, pairs, fasta):
+    '''
+    Is the called allele, written into the reference, base-for-base the simulated one?
+
+    Evaluate otherwise compares alleles by net length only (``--gt_len_tol``), so a call of
+    the right size with the wrong sequence -- a TSD copy dropped, a junction misplaced, a
+    neighbour's allele -- passes. Comparing the haplotypes rather than the ALT strings is
+    what makes this fair across representations: an insertion with a TSD can be written at
+    any anchor along the duplicated bases (the simulation writes it after the TSD, a
+    left-aligning caller before it), and every such record yields the same haplotype.
+
+    Where both files call a genome a carrier, each such genome's non-reference alleles must
+    give the same haplotypes. Where no genome is a carrier in both, the locus passes if any
+    simulated allele and any called allele give the same haplotype. None when nothing is
+    comparable: a symbolic allele, or a contig the reference does not have.
+    '''
+    if match is None or event.chrom != match.chrom or event.chrom not in fasta.references:
+        return None
+    length = fasta.get_reference_length(event.chrom)
+    start = max(0, min(event.pos, match.pos) - 2)
+    end = min(length, max(event.pos - 1 + len(event.ref), match.pos - 1 + len(match.ref)) + 1)
+    cache = {}
+
+    def hap(record, allele):
+        key = (id(record), allele)
+        if key not in cache:
+            cache[key] = _haplotype(fasta, record.chrom, start, end, record.pos, record.ref, allele)
+        return cache[key]
+
+    def non_ref(descs, nonvariant=()):
+        if not descs:
+            return []
+        return [d for d in descs if d.idx != 0 and d.idx not in nonvariant]
+
+    compared = False
+    for tsample, psample in pairs:
+        t_descs = non_ref(event.descs.get(tsample))
+        p_descs = non_ref(match.descs.get(psample), match.nonvariant)
+        if not t_descs or not p_descs:
+            continue
+        if any(d.symbolic for d in t_descs + p_descs):
+            return None
+        compared = True
+        if sorted(hap(event, d.seq) for d in t_descs) != sorted(hap(match, d.seq) for d in p_descs):
+            return False
+    if compared:
+        return True
+    t_alts = [d for d in event.alt_descs if not d.symbolic]
+    p_alts = [d for d in match.alt_descs if not d.symbolic and d.seq != "<*>"]
+    if not t_alts or not p_alts:
+        return None
+    return any(hap(event, t.seq) == hap(match, p.seq) for t in t_alts for p in p_alts)
+
+
 def match_events(events, records, max_dist, tol):
     '''
     Pair each simulated event with at most one prediction record, and vice versa.
@@ -920,6 +984,9 @@ def aggregate(scored_events):
     recovered = len(detected) + len(displaced)
     allele_ok = sum(1 for e in detected if e["match"]["allele_match"])
     allele_comparable = sum(1 for e in detected if e["match"]["allele_match"] is not None)
+    seq_checked = [e for e in detected if "haplotype_identical" in e["match"]]
+    seq_exact = sum(1 for e in seq_checked if e["match"]["haplotype_identical"])
+    seq_comparable = sum(1 for e in seq_checked if e["match"]["haplotype_identical"] is not None)
     tp = sum(e["carriers"]["tp"] for e in scored_events)
     fp = sum(e["carriers"]["fp"] for e in scored_events)
     fn = sum(e["carriers"]["fn"] for e in scored_events)
@@ -947,6 +1014,11 @@ def aggregate(scored_events):
         ("n_allele_concordant", allele_ok),
         ("allele_concordance_rate",
          round(allele_ok / allele_comparable, 4) if allele_comparable else None),
+    ] + ([
+        ("n_haplotype_identical", seq_exact),
+        ("n_haplotype_comparable", seq_comparable),
+        ("haplotype_identity_rate", round(seq_exact / seq_comparable, 4) if seq_comparable else None),
+    ] if seq_checked else []) + [
         ("breakpoint_offset_bp", _spread(offsets)),
         ("allele_length_error_bp", _spread(errors)),
         ("carriers", OrderedDict([
@@ -1115,11 +1187,12 @@ def stratum_headers(unit="loci"):
             "genotype"]
 
 
-def format_report(summary, meta):
+def format_report(summary, meta, title="tevarsim Evaluate", preamble=()):
     '''The printed summary: the headline metrics, then one table per breakdown.'''
     lines = []
     lines.append("")
-    lines.append("tevarsim Evaluate")
+    lines.append(title)
+    lines.extend(preamble)
     lines.append(f"  truth : {meta['truth']}")
     lines.append(f"          {meta['n_loci']} simulated loci over "
                  f"{meta['n_truth_samples']} genomes")
@@ -1156,6 +1229,11 @@ def format_report(summary, meta):
     lines.append(f"  allele concordant    : {overall['n_allele_concordant']} of the "
                  f"{overall['n_detected']} correctly placed  "
                  f"({_pct(overall['allele_concordance_rate'])})")
+    if "n_haplotype_identical" in overall:
+        lines.append(f"  haplotype identical  : {overall['n_haplotype_identical']} of the "
+                     f"{overall['n_haplotype_comparable']} comparable  "
+                     f"({_pct(overall['haplotype_identity_rate'])})   (the called allele, written "
+                     "into the reference, is base-for-base the simulated one)")
     displaced_note = (f"   ({summary['predictions']['displaced']} of them displaced calls)"
                       if summary["predictions"].get("displaced") else "")
     lines.append(f"  unmatched predictions: {summary['predictions']['unmatched']} of "
@@ -1233,43 +1311,13 @@ class Evaluator:
         self.size_bins = tuple(getattr(args, "size_bins", None) or DEFAULT_SIZE_BINS)
         self.af_bins = tuple(getattr(args, "af_bins", None) or DEFAULT_AF_BINS)
         self.no_html = getattr(args, "no_html", False)
+        self.reference = getattr(args, "reference", None)
 
-    def _run(self):
-        # Ground truth. --nHap merges consecutive haplotype columns into one individual,
-        # exactly as Compare does, before anything is paired with the prediction.
-        truth_file = self.truth_file
-        if self.nHap > 1:
-            truth_file = f"{self.outprefix}.polyhap.vcf"
-            convert_to_ploidy(self.truth_file, self.nHap, truth_file)
-        events, truth_samples, truth_rows = load_truth_events(
-            truth_file, self.INSonly, self.TEtype)
-
-        if self.predType == "VCF":
-            records, pred_samples, pred_rows = load_pred_vcf(self.pred_file, self.carrier_info)
-        else:
-            records, pred_samples, pred_rows = load_pred_bed(self.pred_file)
-
-        sample_map = read_sample_map(self.sample_map_file) if self.sample_map_file else None
-        pairs, pairing = pair_samples(truth_samples, pred_samples, sample_map)
-
-        match_events(events, records, self.max_dist, self.gt_len_tol)
-        ordered = sorted(events, key=lambda e: (e.chrom, e.pos))
-        near = nearby_events(events, self.max_dist)
-        scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
-                  for event in ordered]
-        # Which record of the truth file each scored locus came from, in the same order.
-        # Kept beside the scored loci rather than inside them: the report links a locus to
-        # its record with it, and it is a fact about this file rather than about the locus,
-        # so it has no business in the JSON a locus is written to.
-        locus_rows = [event.index for event in ordered]
-
+    def _summarize(self, scored, records, truth_samples):
+        '''Every summary table for one scoring of the loci; also returns the unmatched records.'''
         unmatched_records = [r for r in records if not r.matched]
         matched = len(records) - len(unmatched_records)
         unmatched = len(unmatched_records)
-        filters = ", ".join(
-            part for part in (
-                f"--TEtype {self.TEtype}" if self.TEtype else "",
-                "--INSonly" if self.INSonly else "") if part)
 
         summary = OrderedDict()
         summary["overall"] = aggregate(scored)
@@ -1315,6 +1363,60 @@ class Evaluator:
             summary["by_carrier_count"] = OrderedDict(sorted(
                 stratify(scored, lambda e: e["n_carrier_genomes"]).items(),
                 key=lambda kv: int(kv[0])))
+        return summary, unmatched_records
+
+    def _open_reference(self):
+        if not self.reference:
+            return None
+        try:
+            return pysam.FastaFile(self.reference)
+        except (OSError, ValueError) as err:
+            raise SystemExit(f"[ERROR] --reference {self.reference}: cannot open as an indexed FASTA "
+                             f"({err}); index it with samtools faidx, or copy it somewhere writable") from err
+
+    def _run(self):
+        # Ground truth. --nHap merges consecutive haplotype columns into one individual,
+        # exactly as Compare does, before anything is paired with the prediction.
+        truth_file = self.truth_file
+        if self.nHap > 1:
+            truth_file = f"{self.outprefix}.polyhap.vcf"
+            convert_to_ploidy(self.truth_file, self.nHap, truth_file)
+        events, truth_samples, truth_rows = load_truth_events(
+            truth_file, self.INSonly, self.TEtype)
+
+        if self.predType == "VCF":
+            records, pred_samples, pred_rows = load_pred_vcf(self.pred_file, self.carrier_info)
+        else:
+            records, pred_samples, pred_rows = load_pred_bed(self.pred_file)
+
+        sample_map = read_sample_map(self.sample_map_file) if self.sample_map_file else None
+        pairs, pairing = pair_samples(truth_samples, pred_samples, sample_map)
+
+        match_events(events, records, self.max_dist, self.gt_len_tol)
+        ordered = sorted(events, key=lambda e: (e.chrom, e.pos))
+        near = nearby_events(events, self.max_dist)
+        scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
+                  for event in ordered]
+        # Which record of the truth file each scored locus came from, in the same order.
+        # Kept beside the scored loci rather than inside them: the report links a locus to
+        # its record with it, and it is a fact about this file rather than about the locus,
+        # so it has no business in the JSON a locus is written to.
+        locus_rows = [event.index for event in ordered]
+
+        filters = ", ".join(
+            part for part in (
+                f"--TEtype {self.TEtype}" if self.TEtype else "",
+                "--INSonly" if self.INSonly else "") if part)
+
+        # --reference: is each correctly placed call's allele, written into the reference, the
+        # simulated haplotype base for base? Recorded on every matched locus, and the basis of
+        # the second, sequence-exact evaluation written after the usual one.
+        fasta = self._open_reference()
+        if fasta is not None:
+            for event, entry in zip(ordered, scored):
+                if entry["match"] is not None:
+                    entry["match"]["haplotype_identical"] = haplotype_identical(event, event.match, pairs, fasta)
+        summary, unmatched_records = self._summarize(scored, records, truth_samples)
 
         # With one allele per genome there is no genotype to get right beyond which
         # haplotype is carried, so the concordance that is reported says "haplotype".
@@ -1336,6 +1438,7 @@ class Evaluator:
             ("gt_len_tol", self.gt_len_tol),
             ("nHap", self.nHap),
             ("carrier_info", self.carrier_info),
+            ("reference", self.reference),
             ("size_bins", list(self.size_bins)),
             ("af_bins", list(self.af_bins)),
         ])
@@ -1365,10 +1468,6 @@ class Evaluator:
         ])
         removed = write_locus_files(locus_dir, run, scored, unmatched_records, names)
 
-        with open(out_path, "w") as fo:
-            json.dump(OrderedDict([("meta", meta), ("summary", summary),
-                                   ("loci", scored)]), fo, indent=2)
-            fo.write("\n")
         # The HTML report shows the shape the summary can only average: the per-locus
         # breakpoint and length errors as distributions, and which sizes were missed.
         html_path = None
@@ -1377,6 +1476,52 @@ class Evaluator:
                                      locus_dir=locus_dir, summary_file=out_path,
                                      truth_rows=truth_rows, pred_rows=pred_rows,
                                      locus_rows=locus_rows)
+
+        # The same evaluation again, counting a call only where its haplotype is the simulated
+        # one. A correctly placed call whose sequence differs -- or cannot be compared -- is
+        # unpaired from its locus, which becomes a miss, and the record an unmatched
+        # prediction; a displaced call loses its detection credit, its allele never having
+        # been compared. Done after every output of the usual evaluation is written, because
+        # it unpairs the loci those outputs describe.
+        exact_summary = exact_scored = exact_path = exact_html = None
+        if fasta is not None:
+            for event, entry in zip(ordered, scored):
+                if event.displaced is not None:
+                    event.displaced.displaced_for = None
+                    event.displaced = None
+                if event.match is not None and not entry["match"].get("haplotype_identical"):
+                    event.match.matched = False
+                    event.match.matched_for = None
+                    event.match = None
+            exact_scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
+                            for event in ordered]
+            for entry, original in zip(exact_scored, scored):
+                entry["locus_file"] = original.get("locus_file")
+                if entry["match"] is not None:
+                    entry["match"]["haplotype_identical"] = True
+            exact_summary, exact_unmatched = self._summarize(exact_scored, records, truth_samples)
+            print(format_report(exact_summary, meta,
+                                title="tevarsim Evaluate -- sequence-exact (--reference)",
+                                preamble=[
+                                    "  as above, but a call counts only where its allele, written into the reference, is",
+                                    "  base-for-base the simulated haplotype; any other call is a miss at its locus and an",
+                                    f"  unmatched prediction. reference: {self.reference}"]))
+            exact_path = f"{self.outprefix}.exact.json"
+            with open(exact_path, "w") as fo:
+                json.dump(OrderedDict([("meta", meta), ("summary", exact_summary),
+                                       ("loci", exact_scored)]), fo, indent=2)
+                fo.write("\n")
+            if not self.no_html:
+                exact_html = write_report(f"{self.outprefix}.exact.html", meta, exact_summary, exact_scored,
+                                          locus_dir=locus_dir, summary_file=exact_path,
+                                          truth_rows=truth_rows, pred_rows=pred_rows,
+                                          locus_rows=locus_rows)
+
+        with open(out_path, "w") as fo:
+            json.dump(OrderedDict([("meta", meta), ("summary", summary)]
+                                  + ([("summary_sequence_exact", exact_summary)] if exact_summary else [])
+                                  + [("loci", scored)]), fo, indent=2)
+            fo.write("\n")
 
         # Flush first: the report goes to a block-buffered stdout when it is piped, and the
         # unbuffered stderr note would otherwise land above a report it comes after.
@@ -1389,6 +1534,9 @@ class Evaluator:
               file=sys.stderr)
         if html_path:
             print(f"[INFO] HTML report written to {html_path}", file=sys.stderr)
+        if exact_path:
+            print(f"[INFO] sequence-exact evaluation written to {exact_path}"
+                  + (f" and {exact_html}" if exact_html else ""), file=sys.stderr)
 
         self.meta = meta
         self.summary = summary
@@ -1399,6 +1547,8 @@ class Evaluator:
         self.truth_rows = truth_rows
         self.pred_rows = pred_rows
         self.locus_rows = locus_rows
+        self.exact_summary = exact_summary
+        self.exact_loci = exact_scored
         return self
 
 
