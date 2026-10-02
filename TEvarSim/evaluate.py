@@ -494,34 +494,43 @@ def _closest(size, descs):
     return min((abs(size - s) for s in sizes), default=None)
 
 
-def holds_neighbour_instead(event, neighbours, tsample, p_descs):
-    '''
-    Whether a genome's allele in a multi-allelic call is a neighbouring event's rather than this one's.
+# An ALT of a multi-allelic call is the event's own allele only if it is at least element-sized: within this fraction
+# of the event's allele length, the same direction (insertion or deletion). Wide on purpose -- a caller writing a
+# site's alleles whole folds flank variation into them (a TY4 beside a 218 bp deletion; a call 560 bp short) --
+# and narrow enough that a SNP or small indel written as its own ALT is not taken for a 6 kb element.
+EVENT_ALT_LENGTH_FRACTION = 0.5
 
-    Where two insertions' target sites overlap, a genome carrying only the neighbour has a non-reference allele
-    across this event's site, and a caller rightly writes it as a second ALT of this event's record. Every
-    non-reference allele used to count as carrying the event. Now an allele is this event's unless it is closer in
-    length to an event the genome really carries nearby -- so flank variation folded into the ALT (the same
-    element beside a SNP or a small deletion) still counts, and only another simulated allele takes it away.
+
+def carries_event(event, neighbours, tsample, p_descs):
     '''
-    if not p_descs or not neighbours:
-        return False
-    sizes = [d.size for d in p_descs if d.idx != 0 and not d.symbolic and d.size is not None]
-    if not sizes:
-        return False
+    Whether a genome's allele in a multi-allelic call is this event's.
+
+    A record with several ALTs holds several alleles at one site, and a genome with any of them used to count as
+    carrying the matched event. Two ways that is wrong: the genome's ALT is a different, much smaller variant at
+    the site (a SNP or small indel written as its own allele), or it is a neighbouring simulated insertion the
+    genome carries -- where two target sites overlap, the neighbour interrupts this event's site, and the caller
+    rightly writes that as another ALT of this record. So an ALT is the event's when it is element-sized
+    (EVENT_ALT_LENGTH_FRACTION) and no event within --max_dist that the genome really carries is closer to it in
+    length.
+    '''
+    if not p_descs:
+        return True
+    sizes = [d.size for d in p_descs if d.idx != 0 and d.size is not None and not d.symbolic]
+    if not sizes or any(d.symbolic for d in p_descs if d.idx != 0) or \
+            any(t.symbolic or t.size is None for t in event.alt_descs) or not event.alt_descs:
+        return True                 # nothing comparable by length: every non-reference allele counts, as before
     for size in sizes:
-        mine = _closest(size, event.alt_descs)
-        if mine is None:
-            return False
-        for n in neighbours:
-            if not is_carrier(n.gts.get(tsample, (None,)), {0}):
-                continue
-            theirs = _closest(size, n.alt_descs)
-            if theirs is not None and theirs < mine:
-                break
-        else:
-            return False            # this allele is best explained by the event itself
-    return True
+        sized = [t.size for t in event.alt_descs
+                 if t.size and (size > 0) == (t.size > 0)
+                 and abs(size - t.size) <= EVENT_ALT_LENGTH_FRACTION * abs(t.size)]
+        if not sized:
+            continue
+        mine = min(abs(size - s) for s in sized)
+        if not any(is_carrier(n.gts.get(tsample, (None,)), {0}) and
+                   (_closest(size, n.alt_descs) is not None and _closest(size, n.alt_descs) < mine)
+                   for n in neighbours):
+            return True
+    return False
 
 
 def best_length_error(truth_descs, pred_descs):
@@ -687,8 +696,8 @@ def score_event(event, pairs, tol, neighbours=()):
         else:
             p_gt = match.gts.get(psample, (None,))
             p_carrier = is_carrier(p_gt, match.nonvariant)
-            if p_carrier and multi and holds_neighbour_instead(event, neighbours, tsample,
-                                                               match.descs.get(psample)):
+            if p_carrier and multi and not carries_event(event, neighbours, tsample,
+                                                         match.descs.get(psample)):
                 p_carrier = False
             typed = any(a is not None for a in p_gt)
             if p_carrier:

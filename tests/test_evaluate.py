@@ -915,6 +915,17 @@ def test_a_no_variant_alt_does_not_upset_the_neighbour_test():
     print("PASS test_a_no_variant_alt_does_not_upset_the_neighbour_test")
 
 
+def test_a_small_variant_written_as_another_alt_does_not_carry_the_event():
+    """A SNP-sized ALT in the same record as the element is not the element."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT, ANCHOR + "GATTA"], ".", ["1", "2"])])
+        assert _counts(ev, "carrier") == (1, 1, 1, 0, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (1, 1, 1, 0, 0), _counts(ev, "noncarrier")
+    print("PASS test_a_small_variant_written_as_another_alt_does_not_carry_the_event")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -972,3 +983,4 @@ if __name__ == "__main__":
     test_an_alt_no_simulated_neighbour_explains_still_carries_the_event()
     test_the_same_element_written_as_two_alts_still_carries_the_event()
     test_a_no_variant_alt_does_not_upset_the_neighbour_test()
+    test_a_small_variant_written_as_another_alt_does_not_carry_the_event()
