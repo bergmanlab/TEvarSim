@@ -119,6 +119,7 @@ class PredRecord:
         self.matched_for = None       # the locus this call was paired with
         self.displaced_for = None     # the locus this call found at the wrong anchor
         self.index = None             # position in the prediction file
+        self.carrier_alts = None      # --carrier_info: the ALT indices that are carrier alleles (None: not given)
 
 
 # ---- loading -----------------------------------------------------------------
@@ -340,7 +341,44 @@ def load_truth_events(vcf_file, INSonly, TEtype):
     return events, samples, rows
 
 
-def load_pred_vcf(vcf_file):
+def carrier_alleles(info_text, key, n_alts):
+    '''
+    The ALTs an INFO field marks as carrier alleles, for --carrier_info: a set of 1-based ALT indices.
+
+    A field with one value per allele -- REF first (Number=R, like miniME's ME_INFO) or ALTs only (Number=A) --
+    marks each ALT by its own value, and "." (or empty) means that ALT is not a carrier allele. Any other field on a
+    single-ALT record (GraffiTE's repeat_ids) marks that one ALT by being present and not ".". A record without the
+    field has no carrier allele. None where a multi-ALT record's field cannot be read per allele, so the caller
+    falls back to inferring it.
+    '''
+    value = None
+    for item in info_text.split(";"):
+        name, _, val = item.partition("=")
+        if name == key:
+            value = val if _ else ""
+            break
+    if value is None:
+        return set()
+    values = value.split(",")
+    if len(values) == n_alts + 1 and n_alts > 0:
+        per = values[1:]
+    elif len(values) == n_alts:
+        per = values
+    elif n_alts == 1:
+        per = ["" if value in ("", ".") else value]
+    else:
+        return None
+    return {i + 1 for i, v in enumerate(per) if v not in ("", ".")}
+
+
+def pred_is_carrier(record, gt):
+    '''Whether a genotype of a prediction record carries a variant: by --carrier_info's alleles when given.'''
+    if record.carrier_alts is not None:
+        return any(a in record.carrier_alts for a in gt if a is not None)
+    return is_carrier(gt, record.nonvariant)
+
+
+def load_pred_vcf(vcf_file, carrier_info=None):
     '''
     Read the prediction VCF, keeping every record that any sample calls as a variant.
 
@@ -379,6 +417,8 @@ def load_pred_vcf(vcf_file):
                           tuple(record.alts or ()), gts, descs, alt_descs, nonvariant)
         pred.index = index
         pred.text = text
+        if carrier_info:
+            pred.carrier_alts = carrier_alleles(text.split("\t")[7], carrier_info, len(record.alts or ()))
         records.append(pred)
         rows.append(VcfRow(index, record.chrom, record.pos, text, scored=pred))
     return records, samples, rows
@@ -695,8 +735,8 @@ def score_event(event, pairs, tol, neighbours=()):
             typed = False
         else:
             p_gt = match.gts.get(psample, (None,))
-            p_carrier = is_carrier(p_gt, match.nonvariant)
-            if p_carrier and multi and not carries_event(event, neighbours, tsample,
+            p_carrier = pred_is_carrier(match, p_gt)
+            if p_carrier and multi and match.carrier_alts is None and not carries_event(event, neighbours, tsample,
                                                          match.descs.get(psample)):
                 p_carrier = False
             typed = any(a is not None for a in p_gt)
@@ -926,7 +966,7 @@ def add_unmatched(counts, unmatched_records):
     both -- its locus is already counted as recalled, and its genomes as not genotyped.
     '''
     spurious = [r for r in unmatched_records if r.displaced_for is None]
-    carriers = sum(1 for r in spurious for gt in r.gts.values() if is_carrier(gt, r.nonvariant))
+    carriers = sum(1 for r in spurious for gt in r.gts.values() if pred_is_carrier(r, gt))
     counts["loci"]["fp"] = len(spurious)
     counts["loci"].update(with_rates(counts["loci"]))
     counts["carrier"]["fp"] += carriers
@@ -1092,6 +1132,8 @@ def format_report(summary, meta):
         lines.append("          no genomes could be paired -- carrier and genotype "
                      "statistics are unavailable.")
         lines.append("          Pass --sample_map truth_sample<TAB>pred_sample to pair them.")
+    if meta.get("carrier_info"):
+        lines.append(f"  carriers: the ALTs INFO/{meta['carrier_info']} marks as carrier alleles")
     if meta["filters"]:
         lines.append(f"  filter: {meta['filters']}")
         lines.append("          the truth is filtered but the prediction is not, so "
@@ -1183,6 +1225,7 @@ class Evaluator:
         self.gt_len_tol = getattr(args, "gt_len_tol", 50)
         self.nHap = getattr(args, "nHap", 1)
         self.sample_map_file = getattr(args, "sample_map", None)
+        self.carrier_info = getattr(args, "carrier_info", None)
         self.size_bins = tuple(getattr(args, "size_bins", None) or DEFAULT_SIZE_BINS)
         self.af_bins = tuple(getattr(args, "af_bins", None) or DEFAULT_AF_BINS)
         self.no_html = getattr(args, "no_html", False)
@@ -1198,7 +1241,7 @@ class Evaluator:
             truth_file, self.INSonly, self.TEtype)
 
         if self.predType == "VCF":
-            records, pred_samples, pred_rows = load_pred_vcf(self.pred_file)
+            records, pred_samples, pred_rows = load_pred_vcf(self.pred_file, self.carrier_info)
         else:
             records, pred_samples, pred_rows = load_pred_bed(self.pred_file)
 
@@ -1288,6 +1331,7 @@ class Evaluator:
             ("max_dist", self.max_dist),
             ("gt_len_tol", self.gt_len_tol),
             ("nHap", self.nHap),
+            ("carrier_info", self.carrier_info),
             ("size_bins", list(self.size_bins)),
             ("af_bins", list(self.af_bins)),
         ])
@@ -1412,7 +1456,7 @@ def nearest_event(record, scored):
 def unmatched_payload(record, scored):
     '''Describe a prediction that no simulated event claimed.'''
     carriers = [sample for sample, gt in record.gts.items()
-                if is_carrier(gt, record.nonvariant)]
+                if pred_is_carrier(record, gt)]
     return OrderedDict([
         ("chrom", record.chrom),
         ("pos", record.pos),

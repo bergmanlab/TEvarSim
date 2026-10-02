@@ -926,6 +926,31 @@ def test_a_small_variant_written_as_another_alt_does_not_carry_the_event():
     print("PASS test_a_small_variant_written_as_another_alt_does_not_carry_the_event")
 
 
+def test_carrier_info_marks_which_alts_are_carrier_alleles():
+    """miniME's ME_INFO has one value per allele, REF first; "." means the allele has no element of its own."""
+    samples = ["S0", "S1", "S2"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT, ANCHOR + ELEMENT[:-10]],
+                      "ME_INFO=.,TY1,.", ["1", "2", "0"])], carrier_info="ME_INFO")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+        assert _counts(ev, "noncarrier") == (2, 2, 2, 0, 0), _counts(ev, "noncarrier")
+        assert ev.meta["carrier_info"] == "ME_INFO"
+    print("PASS test_carrier_info_marks_which_alts_are_carrier_alleles")
+
+
+def test_carrier_info_on_a_single_alt_record_is_presence():
+    """GraffiTE-style: a record with no repeat hit carries no TE, and its genomes are not carriers."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"]), _ins(5000, ["0", "1"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], "repeat_ids=TY1", ["1", "0"]),
+                     (5000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1"])], carrier_info="repeat_ids")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+        assert ev.loci[1]["carriers"]["predicted"] == [], ev.loci[1]["carriers"]
+    print("PASS test_carrier_info_on_a_single_alt_record_is_presence")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -984,3 +1009,5 @@ if __name__ == "__main__":
     test_the_same_element_written_as_two_alts_still_carries_the_event()
     test_a_no_variant_alt_does_not_upset_the_neighbour_test()
     test_a_small_variant_written_as_another_alt_does_not_carry_the_event()
+    test_carrier_info_marks_which_alts_are_carrier_alleles()
+    test_carrier_info_on_a_single_alt_record_is_presence()

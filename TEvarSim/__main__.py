@@ -330,6 +330,13 @@ def main():
     Evaluate_parser.add_argument("--gt_len_tol", type=int, default=50,
                     help="Maximum allowed difference (bp) in allele length to consider two "
                          "alleles as the same (default: 50)")
+    Evaluate_parser.add_argument("--carrier_info", type=str, default=None, metavar="KEY",
+                    help="INFO field of the prediction that marks which ALTs are carrier alleles. With one "
+                         "value per allele (REF first, e.g. miniME's ME_INFO, or ALTs only), an ALT whose value "
+                         "is '.' is not a carrier allele and its genomes are noncarriers. On a single-ALT record "
+                         "any other field marks the ALT by being present and not '.' (e.g. GraffiTE's "
+                         "repeat_ids). Without it, a multi-allelic call's carriers are inferred from allele "
+                         "lengths and the simulated neighbours each genome carries")
     Evaluate_parser.add_argument("--size_bins", type=int, action="append", default=None,
                     help="Upper edges (bp) of the event-size strata; repeat the flag per edge "
                          f"(default: {' '.join(map(str, evaluate.DEFAULT_SIZE_BINS))})")
