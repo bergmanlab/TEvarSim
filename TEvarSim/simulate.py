@@ -431,14 +431,21 @@ class Simulator:
                   f"pool record(s) carry no TSD= tag and fell back to --tsd-min/--tsd-max "
                   f"({self.tsd_min}-{self.tsd_max}). Examples: {shown}{more}",file=sys.stderr)
     
+    _MODIFICATION_SUFFIX = re.compile(r"(?:\d+(?:SNP|INDEL|polyA|truncate))*")
+
     def _parse_te_modification(self, te_id: str):
         """
         Parse TE ID into family name and modifications.
         Example: "LINE_1SNP0INDEL5polyA" → ("LINE", {"nSNP":1, "npolyA":5})
+
+        Only a suffix that IS a modification string is one. An insertion's ID always ends in
+        "_" plus its modifications (possibly none), but a deletion's or an excision's ends in
+        the family name, which may hold an underscore of its own: "DEL-...-LTR/Gypsy-TY3_1p-FULL"
+        was cut to "...TY3", and an SVA_A deletion to "...SVA", in INFO/TEFAMILY.
         """
         te_family = te_id
         mods = {}
-        if "_" in te_id:
+        if "_" in te_id and self._MODIFICATION_SUFFIX.fullmatch(te_id.rsplit("_", 1)[1]):
             te_family, mod_str = te_id.rsplit("_", 1)
             for key in ["SNP", "INDEL", "polyA", "truncate"]:
                 match = re.search(rf"(\d+){key}", mod_str)
