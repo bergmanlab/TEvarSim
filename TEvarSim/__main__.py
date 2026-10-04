@@ -264,6 +264,20 @@ def main():
                          "insertions only: deletions and excisions duplicate nothing")
     Simulate_parser.add_argument("--sense-strand-ratio", "-S", type=ratio, default=0.5, 
                     help="Proportion of TE variants in the sense strand (default: 0.5)")
+    # Background variation
+    Simulate_parser.add_argument("--bg-pi", type=float, default=0.0,
+                    help="Background variation: pairwise diversity per bp of SNPs and short indels shared among the "
+                         "genomes by descent (a genealogy per --bg-block), written to <outprefix>.background.vcf and "
+                         "kept out of the TE truth. 0 (default) adds none; real yeast strains differ by ~0.003-0.01")
+    Simulate_parser.add_argument("--bg-indel-frac", type=ratio, default=0.1,
+                    help="Fraction of background variants that are indels, half insertions and half deletions (default: 0.1)")
+    Simulate_parser.add_argument("--bg-indel-max", type=int, default=50,
+                    help="Longest background indel, in bp; lengths are geometric (default: 50)")
+    Simulate_parser.add_argument("--bg-margin", type=int, default=30,
+                    help="Background variants stay this many bp clear of every TE event, so TSDs and scored alleles "
+                         "are the reference's (default: 30)")
+    Simulate_parser.add_argument("--bg-block", type=int, default=50000,
+                    help="Block length, in bp, given its own genealogy: a stand-in for recombination (default: 50000)")
     # Other
     Simulate_parser.add_argument("--seed", "-D", type=int, default=None, 
                     help="Random seed for reproducibility (default: None)")
