@@ -206,7 +206,25 @@ Simulate pTE insertions/deletions and generate VCF and modified genome FASTA.
   own (default: 5/20)
 - `tsd-from-header` : Take each insertion's TSD length from a `TSD=` tag on its pool FASTA header
 - `sense-strand-ratio` : Proportion of sense-strand insertions (default: 0.5)  
+- `bg-pi` : Background variation -- SNPs and short indels shared among the genomes by descent --
+  at this pairwise diversity per bp (default: 0, none). See below
+- `bg-indel-frac / --bg-indel-max / --bg-margin / --bg-block` : Fraction of background variants
+  that are indels (0.1), their longest length (50), how far they stay from any TE event (30 bp),
+  and the block length given its own genealogy (50,000 bp)
 - `seed` : Random seed (default: None)  
+
+**Background variation.** Genomes that differ only by the events simulated never test whether a
+caller can tell an element from everything else that varies at a locus. `--bg-pi` adds that
+background: each `--bg-block` gets a random genealogy of the genomes (Kingman coalescent; one per
+block stands in for recombination), and mutations fall on its branches at a rate that gives
+pairwise diversity `--bg-pi` per bp, each carried by every genome below its branch, so genomes
+share background by descent as real strains do. A `--bg-indel-frac` share are indels (half
+insertions of random sequence, half deletions, geometric length up to `--bg-indel-max`). The
+reference is the genealogy's root. Background stays `--bg-margin` bp clear of every TE event, so
+TSDs and scored alleles are the reference's, and is written to `<outprefix>.background.vcf`, never
+to the TE truth `<outprefix>.vcf`; TErandom `--nSV`'s synthetic insertions and deletions are
+written there too. It draws from a random stream of its own: with or without it, the TE truth is
+the same.
 
 **Per-element TSD.** TSD length is a property of the clade, not a constant: a cut-and-paste
 transposon's TSD is set by the stagger between its transposase's two cuts, so hAT and P

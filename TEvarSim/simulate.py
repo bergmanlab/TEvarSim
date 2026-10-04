@@ -94,6 +94,13 @@ class Simulator:
         self.diverse = args.diverse
         self.diverse_config = args.diverse_config
         self.random_seed = args.seed
+        # Background variation (see _add_background). Read with defaults so callers that build
+        # their own args object, the tests among them, need not know about it.
+        self.bg_pi = getattr(args, "bg_pi", 0.0) or 0.0
+        self.bg_indel_frac = getattr(args, "bg_indel_frac", 0.1)
+        self.bg_indel_max = getattr(args, "bg_indel_max", 50)
+        self.bg_margin = getattr(args, "bg_margin", 30)
+        self.bg_block = getattr(args, "bg_block", 50000)
 
         self.TEevents = []
         if self.random_seed is not None:
@@ -111,7 +118,9 @@ class Simulator:
         self._check_bed()
         self._random_sample_genotypes()
         self.get_TE_tag()
+        self._add_background()
         self.generate_vcf()
+        self.generate_background_vcf()
         self.generate_genome()
 
     def _check_bed(self):
@@ -200,7 +209,9 @@ class Simulator:
                     "te_id": te_id,
                     "type": event_type,
                     "strand":strand,
-                    "ltr_len": ltr_len
+                    "ltr_len": ltr_len,
+                    # TErandom --nSV's synthetic INS/DEL: in the genomes, but not TE truth.
+                    "background": te_id.startswith("bg"),
                 })
         print(f"[INFO] Parsed {len(self.TEevents)} TE events from BED.",file=sys.stderr)
         print(f"[INFO] Example event: {self.TEevents[0] if self.TEevents else 'No events'}",file=sys.stderr)
@@ -456,6 +467,142 @@ class Simulator:
         return te_family, mods
     
 
+    @staticmethod
+    def _genealogy(n: int, rng) -> list:
+        """A random genealogy of n genomes (Kingman coalescent, time in units of the mean pairwise
+        coalescence time), as its branches: (length, carriers below it as a bool array). The root,
+        above every genome, is not a branch -- a mutation there would be carried by all of them."""
+        lineages = [np.zeros(n, dtype=bool) for _ in range(n)]
+        for i in range(n):
+            lineages[i][i] = True
+        lengths = [0.0] * n
+        branches = []
+        k = n
+        while k > 1:
+            t = rng.exponential(1.0 / (k * (k - 1) / 2))
+            lengths = [x + t for x in lengths]
+            i, j = sorted(rng.choice(k, 2, replace=False))
+            branches.append((lengths[i], lineages[i]))
+            branches.append((lengths[j], lineages[j]))
+            merged = lineages[i] | lineages[j]
+            for idx in (j, i):
+                del lineages[idx]
+                del lengths[idx]
+            lineages.append(merged)
+            lengths.append(0.0)
+            k -= 1
+        return branches
+
+    def _add_background(self):
+        """Background variation: SNPs and short indels shared among the genomes by descent.
+
+        Real genomes at one locus differ by far more than their elements, and a caller has to
+        tell the two apart; genomes that differ only by the events simulated never ask it to.
+        So, with --bg-pi, each block of --bg-block bp gets a genealogy of the genomes of its own
+        (a stand-in for recombination), and mutations fall on its branches at a rate that gives
+        pairwise diversity --bg-pi per bp: a mutation is carried by every genome below its
+        branch. --bg-indel-frac of them are indels, half insertions of random sequence and half
+        deletions, of geometric length up to --bg-indel-max. The reference is the genealogy's
+        root, so it carries none of them.
+
+        Background stays --bg-margin bp clear of every TE event, so a TSD and the sequence an
+        allele is scored on are the reference's, and is written to <prefix>.background.vcf, not
+        the TE truth. It draws from a stream of its own, so the TE events, their genotypes and
+        their TSDs are what they would have been without it.
+        """
+        if not self.bg_pi:
+            return
+        rng = np.random.default_rng(None if self.random_seed is None else self.random_seed + 7919)
+        mu = self.bg_pi / 2          # pairwise diversity = 2 * mutation rate * mean pairwise time (1)
+        BASES = "ACGT"
+        n_bg = 0
+        for chrom, info in self.CHR.items():
+            seq, L = info["seq"], info["len"]
+            blocked = sorted((max(0, e["start"] - self.bg_margin), min(L, e["end"] + self.bg_margin))
+                             for e in info["events"])
+            candidates = []
+            for b0 in range(1, L, self.bg_block):
+                b1 = min(L - 1, b0 + self.bg_block)
+                if b1 <= b0:
+                    continue
+                branches = self._genealogy(self.num_genomes, rng)
+                lengths = np.array([b[0] for b in branches])
+                m = rng.poisson(mu * (b1 - b0) * lengths.sum())
+                if m == 0:
+                    continue
+                picks = rng.choice(len(branches), size=m, p=lengths / lengths.sum())
+                for pos, br in zip(rng.integers(b0, b1, size=m), picks):
+                    candidates.append((int(pos), branches[br][1]))
+            candidates.sort(key=lambda c: c[0])
+            added, gts = [], []
+            prev_end, bi = -1, 0
+            for pos, carriers in candidates:
+                r = rng.random()
+                if r < self.bg_indel_frac / 2:
+                    kind, n = "INS", int(min(self.bg_indel_max, rng.geometric(0.3)))
+                elif r < self.bg_indel_frac:
+                    kind, n = "DEL", int(min(self.bg_indel_max, rng.geometric(0.3)))
+                else:
+                    kind, n = "SNP", 1
+                start, end = (pos, pos) if kind == "INS" else (pos, pos + n)
+                # Every event, TE or background, must start after the previous one ends.
+                if end > L - 1 or start <= prev_end:
+                    continue
+                while bi < len(blocked) and blocked[bi][1] <= start:
+                    bi += 1
+                if bi < len(blocked) and blocked[bi][0] <= max(end, start + 1) - 1:
+                    continue
+                if kind == "SNP":
+                    if seq[pos] not in BASES:
+                        continue
+                    ref, alt = seq[pos], str(rng.choice([b for b in BASES if b != seq[pos]]))
+                elif kind == "INS":
+                    ref = seq[pos - 1]
+                    alt = ref + "".join(rng.choice(list(BASES), size=n))
+                else:
+                    if "N" in seq[pos - 1:end]:
+                        continue
+                    ref, alt = seq[pos - 1:end], seq[pos - 1]
+                added.append({"chrom": chrom, "start": start, "end": end, "te_id": f"bg{kind}",
+                              "type": kind, "strand": "+", "ltr_len": None, "tsd_len": 0,
+                              "ref": ref, "alt": alt, "background": True})
+                gts.append(carriers.astype(int))
+                prev_end = start if kind == "INS" else end
+            if not added:
+                continue
+            rows = list(zip(info["events"], info["genotypes"])) + list(zip(added, gts))
+            rows.sort(key=lambda r: (r[0]["start"], r[0]["end"]))
+            info["events"] = [r[0] for r in rows]
+            info["genotypes"] = np.array([r[1] for r in rows], dtype=int).reshape(len(rows), self.num_genomes)
+            n_bg += len(added)
+        print(f"[INFO] Added {n_bg} background variants (pairwise diversity {self.bg_pi}/bp, "
+              f"{self.bg_indel_frac:.0%} indels), written to {self.output_prefix}.background.vcf",
+              file=sys.stderr)
+
+    def generate_background_vcf(self):
+        """The background variants (_add_background, and TErandom --nSV's), apart from the TE truth."""
+        events = [(chrom, i, e) for chrom, info in self.CHR.items()
+                  for i, e in enumerate(info["events"]) if e.get("background")]
+        if not events:
+            return
+        outprefix = os.path.basename(self.output_prefix)
+        with open(f"{self.output_prefix}.background.vcf", "w") as vcf:
+            vcf.write("##fileformat=VCFv4.2\n")
+            for chrom in self.CHR:
+                vcf.write(f"##contig=<ID={chrom},length={self.CHR[chrom]['len']}>\n")
+            vcf.write('##INFO=<ID=TYPE,Number=1,Type=String,Description="Background variant type: SNP, INS or DEL; not a TE event">\n')
+            vcf.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+            samples = [f"{outprefix}_{i}" for i in range(self.num_genomes)]
+            vcf.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(samples) + "\n")
+            for chrom, idx, e in events:
+                genotypes = list(map(str, self.CHR[chrom]["genotypes"][idx]))
+                if all(g == "0" for g in genotypes):
+                    continue
+                # A SNP's REF is its own base (0-based start); INS and DEL carry the base before.
+                pos = e["start"] + 1 if e["type"] == "SNP" else e["start"]
+                vcf.write(f"{chrom}\t{pos}\t{e['te_id']}\t{e['ref']}\t{e['alt']}\t.\tPASS\tTYPE={e['type']}\tGT\t"
+                          + "\t".join(genotypes) + "\n")
+
     def generate_vcf(self):
         """
         Generate a VCF file from parsed TE events with detailed INFO.
@@ -490,6 +637,8 @@ class Simulator:
 
             for chrom,chr_info in self.CHR.items():
                 for idx, event in enumerate(chr_info["events"]):
+                    if event.get("background"):
+                        continue    # written to the background VCF instead: not TE truth
                     genotypes = list(map(str, chr_info["genotypes"][idx]))
                     if all(g=="0" for g in genotypes):
                         continue
@@ -581,6 +730,17 @@ class Simulator:
                     chr_info["chunks"].append(event["alt"][1:])
                     chr_info["cols_to_replace"].append(chr_info["col_index"])
                     chr_info["gt_row"].append(event_idx)
+                elif SVtype == "SNP":
+                    # Background substitution: the reference base when the genotype is 0
+                    # (flipped, like a deletion), the alternative base when it is 1.
+                    chr_info["chunks"].append(event["ref"])
+                    chr_info["flipped"].append(chr_info["col_index"])
+                    chr_info["cols_to_replace"].append(chr_info["col_index"])
+                    chr_info["gt_row"].append(event_idx)
+                    chr_info["col_index"] += 1
+                    chr_info["chunks"].append(event["alt"])
+                    chr_info["cols_to_replace"].append(chr_info["col_index"])
+                    chr_info["gt_row"].append(event_idx)
                 elif SVtype == "EXC":
                     # Substitution: the full element chunk is present when the genotype is 0
                     # (flipped, like a deletion) and the solo LTR chunk when it is 1. Both
@@ -633,8 +793,10 @@ class Simulator:
                     mask = indexMat[:, idx].astype(bool)
                     mask[flipped] = ~mask[flipped]
                     if self.diverse:
-                        # introduce sequence diversity for each TE-events
-                        mask_seq = [m if i in cols_to_replace else 0 for i, m in enumerate(mask)]
+                        # introduce sequence diversity for each TE-events (not background ones)
+                        te_cols = {c for c, ev in zip(cols_to_replace, chr_info["gt_row"])
+                                   if not chr_info["events"][ev].get("background")}
+                        mask_seq = [m if i in te_cols else 0 for i, m in enumerate(mask)]
                         if self.diverse_config:
                             divConfig = Get_config(self.diverse_config)
                             diverse_chunks = [SeqDiverse(chunk, **divConfig) if use else chunk for chunk, use in zip(chunks, mask_seq)]

@@ -81,7 +81,12 @@ def main():
     TErandom_parser.add_argument("--nDEL", type=int, default=0,
                     help="Number of TE deletions to simulate from --existingTEs (default: 0)")
     TErandom_parser.add_argument("--nEXC", type=int, default=0,
-                    help="Number of LTR-LTR recombinations (excisions of full-length LTR elements into solo LTRs) to simulate from --existingTEs; requires a RepeatMasker .out file (default: 0)")
+                    help="Number of LTR-LTR recombinations (excisions of full-length LTR elements into solo LTRs) to simulate, "
+                         "from a RepeatMasker .out --existingTEs or from --excCandidates (default: 0)")
+    TErandom_parser.add_argument("--excCandidates", type=Existing_File_Path, default=None,
+                    help="BED of full-length LTR elements eligible for excision: chrom, start, end (the element alone, "
+                         "no TSD), name#class/family, score, strand, and the 5' LTR length in a 7th column. A deletion "
+                         "candidate overlapping an element chosen for excision is not deleted as well")
     TErandom_parser.add_argument("--outprefix", "-O", type=File_Path, default="TErandom", 
                     help="Output prefix for the generated TE pool FASTA file and the bed file (default: TErandom)")
     TErandom_parser.add_argument("--DELlen", type=int, default=100,
@@ -264,6 +269,20 @@ def main():
                          "insertions only: deletions and excisions duplicate nothing")
     Simulate_parser.add_argument("--sense-strand-ratio", "-S", type=ratio, default=0.5, 
                     help="Proportion of TE variants in the sense strand (default: 0.5)")
+    # Background variation
+    Simulate_parser.add_argument("--bg-pi", type=float, default=0.0,
+                    help="Background variation: pairwise diversity per bp of SNPs and short indels shared among the "
+                         "genomes by descent (a genealogy per --bg-block), written to <outprefix>.background.vcf and "
+                         "kept out of the TE truth. 0 (default) adds none; real yeast strains differ by ~0.003-0.01")
+    Simulate_parser.add_argument("--bg-indel-frac", type=ratio, default=0.1,
+                    help="Fraction of background variants that are indels, half insertions and half deletions (default: 0.1)")
+    Simulate_parser.add_argument("--bg-indel-max", type=int, default=50,
+                    help="Longest background indel, in bp; lengths are geometric (default: 50)")
+    Simulate_parser.add_argument("--bg-margin", type=int, default=30,
+                    help="Background variants stay this many bp clear of every TE event, so TSDs and scored alleles "
+                         "are the reference's (default: 30)")
+    Simulate_parser.add_argument("--bg-block", type=int, default=50000,
+                    help="Block length, in bp, given its own genealogy: a stand-in for recombination (default: 50000)")
     # Other
     Simulate_parser.add_argument("--seed", "-D", type=int, default=None, 
                     help="Random seed for reproducibility (default: None)")
@@ -398,10 +417,12 @@ def main():
         if args.nINS + args.nDEL + args.nEXC == 0:
             parser.error("Nothing to simulate: set at least one of --nINS, --nDEL, --nEXC to a value > 0.")
     if args.command == "TErandom":
-        if (args.nDEL > 0 or args.nEXC > 0) and not args.existingTEs:
-            TErandom_parser.error("--existingTEs is required when --nDEL or --nEXC > 0.")
-        if args.nEXC > 0 and not str(args.existingTEs).lower().endswith(".out"):
-            TErandom_parser.error("--nEXC requires a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
+        if args.nDEL > 0 and not args.existingTEs:
+            TErandom_parser.error("--existingTEs is required when --nDEL > 0.")
+        if args.nEXC > 0 and not (args.existingTEs or args.excCandidates):
+            TErandom_parser.error("--existingTEs or --excCandidates is required when --nEXC > 0.")
+        if args.nEXC > 0 and not args.excCandidates and not str(args.existingTEs).lower().endswith(".out"):
+            TErandom_parser.error("--nEXC requires --excCandidates, or a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
     if args.command == "TEreal" and args.nEXC > 0 and not str(args.existingTEs).lower().endswith(".out"):
             TEreal_parser.error("--nEXC requires a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
     if args.command == "TEpan" and args.nEXC > 0:

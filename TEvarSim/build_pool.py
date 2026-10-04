@@ -186,6 +186,7 @@ class RandomTE:
         self.pool_fasta = args.outprefix + ".fa"
         self.out_fasta = args.outprefix + ".bgSV.fa"
         self.DELfile = args.existingTEs
+        self.EXCfile = getattr(args, "excCandidates", None)
         self.sense_strand_ratio = args.sense_strand_ratio
         self.CHR = {}
         if not os.path.isfile(f"{args.ref}.fai"):
@@ -315,8 +316,12 @@ class RandomTE:
                 f"available in --existingTEs after filtering. Lower --nEXC, or relax --TEtype/--DELlen."
             )
         chosen = random.sample(self.EXC, self.nEXC)
-        chosen_spans = {(c[0], c[1], c[2]) for c in chosen}
-        self.DEL = [d for d in self.DEL if (d[0], d[1], d[2]) not in chosen_spans]
+        # A deletion candidate that overlaps a chosen element is that element (with --excCandidates the
+        # deletion's span carries the TSD copy the excision's does not), so it cannot be deleted as well.
+        by_chrom = {}
+        for c in chosen:
+            by_chrom.setdefault(c[0], []).append((c[1], c[2]))
+        self.DEL = [d for d in self.DEL if not any(d[1] < e and s < d[2] for s, e in by_chrom.get(d[0], []))]
         self.EXC = chosen
 
     def build_bed(self):
@@ -336,7 +341,8 @@ class RandomTE:
     
     def parse_DEL(self):
         self.DEL = []
-        self.EXC = []  # full-length LTR elements eligible for excision (RepeatMasker input only)
+        self.EXC = []  # full-length LTR elements eligible for excision (RepeatMasker input, or --excCandidates)
+        self.parse_EXC_candidates()
         if not self.DELfile:
             return
         # process file
@@ -378,6 +384,28 @@ class RandomTE:
                     teID = f"DEL-{chrom}-{start}-{end}-{class_fam}-{name}"
                     self.DEL.append((chrom, start, end, teID, repClass,"DEL",strand))
     
+    def parse_EXC_candidates(self):
+        """Excision candidates from --excCandidates: full-length LTR elements whose span is known exactly,
+        given as the element alone (no TSD) with its 5' LTR length in a 7th column. The excision leaves
+        that LTR, between the element's two target-site copies, as RepeatMasker-derived candidates do."""
+        if not self.EXCfile:
+            return
+        with open(self.EXCfile) as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 7:
+                    raise ValueError(f"--excCandidates needs 7 columns (the 7th the 5' LTR length): {line.strip()}")
+                chrom, start, end = fields[0], int(fields[1]), int(fields[2])
+                name, class_fam = fields[3].split("#")
+                repClass = class_fam.split("/")[0]
+                strand, ltr_len = fields[5], int(fields[6])
+                if repClass not in self.TEtype or not 0 < ltr_len < end - start:
+                    continue
+                exc_id = f"EXC-{chrom}-{start}-{end}-{ltr_len}-{class_fam}-{name}"
+                self.EXC.append((chrom, start, end, exc_id, repClass, "EXC", strand, ltr_len))
+
     def parse_DEL_repeatmasker(self):
         repeatmasker_records = {}
         with open(self.DELfile) as f:

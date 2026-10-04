@@ -140,7 +140,8 @@ def sample_TEins(regions, deletions, n: int, TEdistance: int, target_strands: li
     return positions
 
 # ---------------- adding background SVs ----------------
-def bgSV(bedin:str, bedout:str, nSV:int, ins_ratio:float, fasta_in:str, fasta_out:str):
+def bgSV(bedin:str, bedout:str, nSV:int, ins_ratio:float, fasta_in:str, fasta_out:str,
+         margin:int = 30, seed=None):
     """
     Add background SVs (INS/DEL) to a BED file.
     Args:
@@ -148,79 +149,82 @@ def bgSV(bedin:str, bedout:str, nSV:int, ins_ratio:float, fasta_in:str, fasta_ou
         bedout: output BED file with added SVs
         nSV: number of SVs to add
         ins_ratio: ratio of insertions among the background SVs
-        fasta_file: FASTA file of sequences with newly added insertions (INS)
+        fasta_in / fasta_out: the pool, and the pool with the new insertion sequences added
+        margin: background SVs stay this many bp clear of every TE event and of one another
+
+    Insertions are points (start == end), as TErandom writes a TE insertion: an end one past
+    the start made Simulate skip that reference base in every carrier. Positions are drawn per
+    contig, from the gaps between that contig's events weighted by length -- the gaps were
+    once pooled across contigs and every SV written to the last contig read -- and not only
+    from the longest gaps, so a background SV can sit anywhere a TE event does not.
     """
-    # parse the input bed file
+    rnd = random.Random(seed) if seed is not None else random   # the global stream TErandom seeds
     TEs = []
     with open(bedin, "r") as fin:
         for line in fin:
-            fields = line.strip().split("\t")
-            chrom, start, end, teID = fields[0], int(fields[1]), int(fields[2]), fields[3]
-            TEs.append((chrom, start, end, teID))
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            TEs.append(tuple(fields[:3]) + tuple(fields[3:]))
+    events = [(f[0], int(f[1]), int(f[2])) for f in TEs]
 
-    # number of background SVs
     nINS = int(nSV * ins_ratio)
     nDEL = nSV - nINS
-    
-    # generating DEL and INS randomly
     SVmin, SVmax = 30, 300
-    # DELlens = np.random.uniform(low=SVmin, high=SVmax, size=nDEL)
-    INSlens = np.random.randint(low=SVmin, high=SVmax, size=nINS)
-    # INS sequences
-    bgINS_seqs = []
-    for idx, ilen in enumerate(INSlens):
-        seq = ''.join(random.choices('ATGC', k=ilen))
-        bgINS_seqs.append((f"bgINS_{idx}_{ilen}", seq))
-    
-    # output all INS sequences to new fasta file
+
+    # Free gaps per contig, between that contig's events (with the margin), from its first event to its last.
+    by_chrom = {}
+    for chrom, s0, e0 in events:
+        by_chrom.setdefault(chrom, []).append((s0 - margin, e0 + margin))
+    gaps = []
+    for chrom, spans in by_chrom.items():
+        spans.sort()
+        prev_end = spans[0][1]
+        for s0, e0 in spans[1:]:
+            if s0 > prev_end:
+                gaps.append((chrom, prev_end, s0))
+            prev_end = max(prev_end, e0)
+    if not gaps:
+        raise ValueError("No room between TE events for background SVs.")
+
+    taken = {}
+    def free(chrom, lo, hi):
+        return all(hi + margin <= a or b + margin <= lo for a, b in taken.get(chrom, []))
+
+    def draw(length):
+        weights = [b - a - length for _, a, b in gaps]
+        weights = [max(0, w) for w in weights]
+        if not any(weights):
+            raise ValueError(f"No gap between TE events holds a {length} bp background SV.")
+        for _ in range(1000):
+            chrom, a, b = rnd.choices(gaps, weights=weights, k=1)[0]
+            lo = rnd.randint(a, b - length)
+            if free(chrom, lo, lo + max(length, 1)):
+                taken.setdefault(chrom, []).append((lo, lo + max(length, 1)))
+                return chrom, lo
+        raise ValueError("Too many background SVs for the room between TE events; ask for fewer.")
+
+    new_bed, bgINS_seqs = [], []
+    for idx in range(nDEL):
+        del_len = rnd.randint(SVmin, SVmax)
+        chrom, lo = draw(del_len)
+        new_bed.append((chrom, lo, lo + del_len, f"bgDEL_{idx}_{del_len}"))
+    for idx in range(nINS):
+        ilen = rnd.randint(SVmin, SVmax - 1)
+        name = f"bgINS_{idx}_{ilen}"
+        bgINS_seqs.append((name, ''.join(rnd.choices('ATGC', k=ilen))))
+        chrom, lo = draw(0)
+        new_bed.append((chrom, lo, lo, name))
+
     records = list(SeqIO.parse(fasta_in, "fasta"))
-    new_records = [SeqRecord(Seq(i), id=j) for j, i in bgINS_seqs]
-    records.extend(new_records)
+    records.extend(SeqRecord(Seq(seq), id=name) for name, seq in bgINS_seqs)
     SeqIO.write(records, fasta_out, "fasta")
-    
-    # intervals for background SV
-    existing_intervals = [(i[1], i[2]) for i in TEs]
-    empty_intervals = []
-    prev_end = existing_intervals[0][1]
-    for start, end in existing_intervals:
-        if start > prev_end:
-            empty_intervals.append((start - prev_end, prev_end, start))
-        prev_end = max(prev_end, end)
-    
-    # sample DEL and INS positions
-    # not allow for too much background SVs
-    max_DEL = len(empty_intervals) // 2
-    if nDEL > max_DEL:
-        raise ValueError(f"Too much background deletions. We recommend to reduce the number of background deletions < {max_DEL}.")
-    # select longer empty intervals for DEL
-    empty_intervals.sort(reverse=True)
-    candidate_DEL_intervals = empty_intervals[:nDEL]
-    candidate_INS_intervals = empty_intervals[nDEL:]
-    # background SV positions
-    # bgSV_positions = []
-    # sample DEL positions
-    SVmin = min(empty_intervals[nDEL][0], SVmin)
-    for idx, i in enumerate(candidate_DEL_intervals):
-        length, e_start, e_end = i
-        del_len = random.randint(SVmin, min(SVmax, length))
-        del_start = random.randint(e_start, e_end - del_len)
-        TEs.append((chrom, del_start, del_start + del_len, f"bgDEL_{idx}_{del_len}"))
-    # sample INS positions
-    sampled_points = set()
-    length_eachINS_intervals = [i[0] for i in candidate_INS_intervals]
-    while len(sampled_points) < nINS:
-        interval = random.choices(candidate_INS_intervals, weights=length_eachINS_intervals, k=1)[0]
-        _, start, end = interval
-        point = random.randint(start, end)
-        sampled_points.add(point)
-    for i, j in zip(sampled_points, bgINS_seqs):
-        TEs.append((chrom, i, i+1, j[0]))
-    
-    # output the new bed file
+
+    rows = [tuple(t) for t in TEs] + [(c, str(a), str(b), n) for c, a, b, n in new_bed]
+    rows.sort(key=lambda r: (r[0], int(r[1]), int(r[2])))
     with open(bedout, "w") as fout:
-        TEs.sort()
-        for te in TEs:
-            fout.write(f"{te[0]}\t{te[1]}\t{te[2]}\t{te[3]}\n")
+        for r in rows:
+            fout.write("\t".join(map(str, r)) + "\n")
 
 # ---------------- select TEs with the restrict of minimum number ----------------
 def make_min_TE(TE_list: list, nMIN: int, nTE: int, TEtype: set, target_strands: list):

@@ -254,14 +254,19 @@ def test_header_tsd_does_not_move_the_global_stream():
 
 
 def test_background_insertions_keep_zero_tsd_and_do_not_warn():
-    """bgSV writes its synthetic sequence into the pool untagged; it must not be flagged."""
+    """bgSV writes its synthetic sequence into the pool untagged; it must not be flagged. It
+    duplicates nothing, and it is background, not TE truth: it goes to <prefix>.background.vcf,
+    with an ALT of the anchor base and the inserted sequence alone."""
     with tempfile.TemporaryDirectory() as d:
         err = io.StringIO()
         with redirect_stderr(err):
             records, _ = _run(d, [_ins(INS_POS, "bgINS_0_20")],
                               [(">bgINS_0_20", ELEMENT)],
                               tsd_min=8, tsd_max=8, tsd_from_header=True)
-        assert _info(records[0])["TSD"] == "0", _info(records[0])
+        assert records == [], records
+        with open(os.path.join(d, "Sim.background.vcf")) as f:
+            background = [line.rstrip("\n").split("\t") for line in f if not line.startswith("#")]
+        assert len(background) == 1 and background[0][4] == background[0][3] + ELEMENT, background
         assert "--tsd-from-header" not in err.getvalue(), err.getvalue()
 
 
