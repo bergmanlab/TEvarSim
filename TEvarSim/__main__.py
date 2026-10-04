@@ -81,7 +81,12 @@ def main():
     TErandom_parser.add_argument("--nDEL", type=int, default=0,
                     help="Number of TE deletions to simulate from --existingTEs (default: 0)")
     TErandom_parser.add_argument("--nEXC", type=int, default=0,
-                    help="Number of LTR-LTR recombinations (excisions of full-length LTR elements into solo LTRs) to simulate from --existingTEs; requires a RepeatMasker .out file (default: 0)")
+                    help="Number of LTR-LTR recombinations (excisions of full-length LTR elements into solo LTRs) to simulate, "
+                         "from a RepeatMasker .out --existingTEs or from --excCandidates (default: 0)")
+    TErandom_parser.add_argument("--excCandidates", type=Existing_File_Path, default=None,
+                    help="BED of full-length LTR elements eligible for excision: chrom, start, end (the element alone, "
+                         "no TSD), name#class/family, score, strand, and the 5' LTR length in a 7th column. A deletion "
+                         "candidate overlapping an element chosen for excision is not deleted as well")
     TErandom_parser.add_argument("--outprefix", "-O", type=File_Path, default="TErandom", 
                     help="Output prefix for the generated TE pool FASTA file and the bed file (default: TErandom)")
     TErandom_parser.add_argument("--DELlen", type=int, default=100,
@@ -412,10 +417,12 @@ def main():
         if args.nINS + args.nDEL + args.nEXC == 0:
             parser.error("Nothing to simulate: set at least one of --nINS, --nDEL, --nEXC to a value > 0.")
     if args.command == "TErandom":
-        if (args.nDEL > 0 or args.nEXC > 0) and not args.existingTEs:
-            TErandom_parser.error("--existingTEs is required when --nDEL or --nEXC > 0.")
-        if args.nEXC > 0 and not str(args.existingTEs).lower().endswith(".out"):
-            TErandom_parser.error("--nEXC requires a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
+        if args.nDEL > 0 and not args.existingTEs:
+            TErandom_parser.error("--existingTEs is required when --nDEL > 0.")
+        if args.nEXC > 0 and not (args.existingTEs or args.excCandidates):
+            TErandom_parser.error("--existingTEs or --excCandidates is required when --nEXC > 0.")
+        if args.nEXC > 0 and not args.excCandidates and not str(args.existingTEs).lower().endswith(".out"):
+            TErandom_parser.error("--nEXC requires --excCandidates, or a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
     if args.command == "TEreal" and args.nEXC > 0 and not str(args.existingTEs).lower().endswith(".out"):
             TEreal_parser.error("--nEXC requires a RepeatMasker .out --existingTEs file (LTR fragment structure is needed to identify full-length elements).")
     if args.command == "TEpan" and args.nEXC > 0:
