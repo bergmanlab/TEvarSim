@@ -1115,6 +1115,29 @@ def load_nonmobilizing(vcf_file):
     return sites
 
 
+BG_SV_SIZE_BINS = ((500, "50-499 bp"), (2000, "500-1,999 bp"), (None, "2-10 kb"))
+
+
+def load_background_sv(vcf_file):
+    '''The background SVs Simulate wrote (--bg-sv-rate), in the shape load_nonmobilizing gives: a
+    duplication spans the stretch it copies (INFO/DUPSTART to POS), a deletion what it removes. The
+    kind is the type and a size class.'''
+    sites = []
+    vcf = pysam.VariantFile(vcf_file)
+    for record in vcf:
+        carriers = sum(1 for s in record.samples.values()
+                       if any(a not in (None, 0) for a in (s.get("GT") or ())))
+        typ = record.info.get("TYPE", ".")
+        size = abs(int(record.info.get("SVLEN", 0)))
+        label = next(lab for edge, lab in BG_SV_SIZE_BINS if edge is None or size < edge)
+        start = int(record.info["DUPSTART"]) if typ == "DUP" and "DUPSTART" in record.info else record.pos
+        end = record.pos if typ == "DUP" else record.pos + len(record.ref) - 1
+        sites.append(OrderedDict([
+            ("chrom", record.chrom), ("pos", start), ("end", end), ("id", record.id),
+            ("kind", f"{typ} {label}"), ("size", size), ("n_carriers", carriers)]))
+    return sites
+
+
 def score_nonmobilizing(sites, unmatched_records, max_dist):
     '''
     The calls a caller made at non-mobilizing SVs. A call that matched no simulated locus and whose
@@ -1378,6 +1401,20 @@ def format_report(summary, meta, title="tevarsim Evaluate", preamble=()):
         if len(unsupported) > 5:
             lines.append(f"  ... and {len(unsupported) - 5} more")
 
+    bg = summary.get("background_sv")
+    if bg is not None:
+        lines.append("")
+        lines.append(f"Background SVs ({bg['sites']} in {meta.get('background_sv')})")
+        lines.append("  deletions and tandem duplications that are no TE event, placed at random; a TE caller should")
+        lines.append("  call none. A call on none of the simulated loci that comes within --max_dist of one is charged")
+        lines.append("  to it, and is among the unmatched predictions above")
+        lines.append(f"  sites called         : {bg['sites_called']} / {bg['sites']}"
+                     f"  ({_pct(bg['sites_called'] / bg['sites'] if bg['sites'] else None)})")
+        lines.append(f"  calls at them        : {bg['calls']} of the {summary['predictions']['unmatched']} unmatched predictions")
+        lines.extend(_table(["type, size", "sites", "called", "calls"],
+                            [[kind, row["sites"], row["sites_called"], row["calls"]]
+                             for kind, row in bg["by_kind"].items()]))
+
     nm = summary.get("nonmobilizing")
     if nm is not None:
         lines.append("")
@@ -1429,6 +1466,8 @@ class Evaluator:
         self.reference = getattr(args, "reference", None)
         self.nonmobilizing_file = getattr(args, "nonmobilizing", None)
         self.nonmobilizing = load_nonmobilizing(self.nonmobilizing_file) if self.nonmobilizing_file else None
+        self.background_sv_file = getattr(args, "background_sv", None)
+        self.background_sv = load_background_sv(self.background_sv_file) if self.background_sv_file else None
 
     def _summarize(self, scored, records, truth_samples):
         '''Every summary table for one scoring of the loci; also returns the unmatched records.'''
@@ -1478,6 +1517,12 @@ class Evaluator:
             _af_bin_labels(self.af_bins))
         if self.nonmobilizing is not None:
             summary["nonmobilizing"] = score_nonmobilizing(self.nonmobilizing, unmatched_records, self.max_dist)
+        if self.background_sv is not None:
+            # The same charging as for non-mobilizing SVs; the kinds sort by type, then size.
+            scored = score_nonmobilizing(self.background_sv, unmatched_records, self.max_dist)
+            order = [f"{t} {lab}" for t in ("DEL", "DUP") for _, lab in BG_SV_SIZE_BINS]
+            scored["by_kind"] = OrderedDict((k, scored["by_kind"][k]) for k in order if k in scored["by_kind"])
+            summary["background_sv"] = scored
         if len(truth_samples) <= MAX_GENOMES_FOR_CARRIER_TABLE:
             summary["by_carrier_count"] = OrderedDict(sorted(
                 stratify(scored, lambda e: e["n_carrier_genomes"]).items(),
@@ -1559,6 +1604,7 @@ class Evaluator:
             ("carrier_info", self.carrier_info),
             ("reference", self.reference),
             ("nonmobilizing", self.nonmobilizing_file),
+            ("background_sv", self.background_sv_file),
             ("size_bins", list(self.size_bins)),
             ("af_bins", list(self.af_bins)),
         ])

@@ -317,6 +317,17 @@ def main():
                          "are the reference's (default: 30)")
     Simulate_parser.add_argument("--bg-block", type=int, default=50000,
                     help="Block length, in bp, given its own genealogy: a stand-in for recombination (default: 50000)")
+    Simulate_parser.add_argument("--bg-sv-rate", type=float, default=0.0,
+                    help="Background structural variants: deletions and tandem duplications per genome per Mb, counted "
+                         "against the reference, on the same genealogies as --bg-pi's variants, so shared by descent. "
+                         "Placed anywhere but within --bg-margin of a TE event; written to <outprefix>.background_sv.vcf "
+                         "and kept out of the TE truth. 0 (default) adds none")
+    Simulate_parser.add_argument("--bg-sv-dup-frac", type=ratio, default=0.5,
+                    help="Fraction of background SVs that are tandem duplications; the rest are deletions (default: 0.5)")
+    Simulate_parser.add_argument("--bg-sv-min", type=int, default=50,
+                    help="Shortest background SV, in bp; lengths are log-uniform (default: 50)")
+    Simulate_parser.add_argument("--bg-sv-max", type=int, default=10000,
+                    help="Longest background SV, in bp (default: 10000)")
     # Other
     Simulate_parser.add_argument("--seed", "-D", type=int, default=None, 
                     help="Random seed for reproducibility (default: None)")
@@ -402,6 +413,11 @@ def main():
                          "a reference element by no TE mechanism. Reports how many of them the prediction called, by kind: "
                          "every unmatched call within --max_dist of one is charged to it. Those calls stay unmatched "
                          "predictions, so they count against precision either way")
+    Evaluate_parser.add_argument("--background_sv", type=Existing_File_Path, default=None, metavar="VCF",
+                    help="Simulate's <outprefix>.background_sv.vcf (--bg-sv-rate): deletions and tandem duplications "
+                         "that are no TE event. Reports how many the prediction called, by type and size: every "
+                         "unmatched call within --max_dist of one is charged to it. Those calls stay unmatched "
+                         "predictions, so they count against precision either way")
     Evaluate_parser.add_argument("--size_bins", type=int, action="append", default=None,
                     help="Upper edges (bp) of the event-size strata; repeat the flag per edge "
                          f"(default: {' '.join(map(str, evaluate.DEFAULT_SIZE_BINS))})")
@@ -479,6 +495,8 @@ def main():
             parser.error("--diverse_config requires --diverse to be set")
         # An inverted TSD pair dies inside np.random.randint without naming either flag,
         # unlike the allele frequency pair, which Simulator checks for itself.
+        if args.bg_sv_rate < 0 or not 1 <= args.bg_sv_min <= args.bg_sv_max:
+            Simulate_parser.error("--bg-sv-rate must be >= 0 and 1 <= --bg-sv-min <= --bg-sv-max")
         if args.tsd_min > args.tsd_max:
             Simulate_parser.error("--tsd-min must be less than or equal to --tsd-max")
         if args.tsd_min < 0:

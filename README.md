@@ -230,6 +230,10 @@ Simulate pTE insertions/deletions and generate VCF and modified genome FASTA.
 - `sense-strand-ratio` : Proportion of sense-strand insertions (default: 0.5)  
 - `bg-pi` : Background variation -- SNPs and short indels shared among the genomes by descent --
   at this pairwise diversity per bp (default: 0, none). See below
+- `bg-sv-rate` : Background structural variants -- deletions and tandem duplications -- per genome per Mb
+  against the reference, on the same genealogies (default: 0, none). See below
+- `bg-sv-dup-frac / --bg-sv-min / --bg-sv-max` : Fraction that are duplications (0.5), and the log-uniform
+  length range (50-10,000 bp)
 - `bg-indel-frac / --bg-indel-max / --bg-margin / --bg-block` : Fraction of background variants
   that are indels (0.1), their longest length (50), how far they stay from any TE event (30 bp),
   and the block length given its own genealogy (50,000 bp)
@@ -247,6 +251,15 @@ TSDs and scored alleles are the reference's, and is written to `<outprefix>.back
 to the TE truth `<outprefix>.vcf`; TErandom `--nSV`'s synthetic insertions and deletions are
 written there too. It draws from a random stream of its own: with or without it, the TE truth is
 the same.
+
+**Background SVs.** `--bg-sv-rate` adds deletions and tandem duplications that no TE made, at that
+many per genome per Mb against the reference, on the same per-block genealogies as the background SNPs,
+so genomes share them by descent. Lengths are log-uniform from `--bg-sv-min` to `--bg-sv-max`; they land
+anywhere, over the reference's own elements as readily as elsewhere, but never within `--bg-margin` of a
+TE event or of one another, nor over an N. A duplication is a copy of its stretch inserted right after it.
+They are written to `<outprefix>.background_sv.vcf` (a duplication's record sits at the end of the copied
+stretch, with `INFO/DUPSTART` at its start), never to the TE truth, and `Evaluate --background_sv` counts
+the calls a caller made at them, by type and size.
 
 **Per-element TSD.** TSD length is a property of the clade, not a constant: a cut-and-paste
 transposon's TSD is set by the stagger between its transposase's two cuts, so hAT and P
@@ -406,6 +419,8 @@ the events and so total more than the loci. No genome is named on the command li
   same locus (default: 100)
 - `gt_len_tol` : Maximum allowed difference (bp) in allele length to consider two alleles the same
   (default: 50)
+- `background_sv` : Simulate's `<outprefix>.background_sv.vcf`. Reports how many of the background SVs the
+  prediction called, by type and size; scored as `--nonmobilizing` is
 - `nonmobilizing` : Simulate's `<outprefix>.nonmobilizing.vcf`. Reports how many of the non-mobilizing
   SVs the prediction called, by kind: every unmatched call within `--max_dist` of one is charged to it.
   Those calls stay unmatched predictions, so they count against precision either way

@@ -101,6 +101,11 @@ class Simulator:
         self.bg_indel_max = getattr(args, "bg_indel_max", 50)
         self.bg_margin = getattr(args, "bg_margin", 30)
         self.bg_block = getattr(args, "bg_block", 50000)
+        # Background structural variants (see _add_background): deletions and tandem duplications.
+        self.bg_sv_rate = getattr(args, "bg_sv_rate", 0.0) or 0.0
+        self.bg_sv_dup_frac = getattr(args, "bg_sv_dup_frac", 0.5)
+        self.bg_sv_min = getattr(args, "bg_sv_min", 50)
+        self.bg_sv_max = getattr(args, "bg_sv_max", 10000)
 
         self.TEevents = []
         if self.random_seed is not None:
@@ -122,6 +127,7 @@ class Simulator:
         self.generate_vcf()
         self.generate_background_vcf()
         self.generate_nonmobilizing_vcf()
+        self.generate_background_sv_vcf()
         self.generate_genome()
 
     def _check_bed(self):
@@ -512,22 +518,35 @@ class Simulator:
         deletions, of geometric length up to --bg-indel-max. The reference is the genealogy's
         root, so it carries none of them.
 
+        With --bg-sv-rate, structural variants fall on the same genealogies: deletions and tandem
+        duplications (--bg-sv-dup-frac of them), log-uniform in length over --bg-sv-min to
+        --bg-sv-max bp, placed anywhere -- over the reference's own elements as readily as anywhere
+        else -- but never within --bg-margin of a TE event or of another one, nor over an N. The rate
+        is what one genome carries against the reference, per Mb: a genome's mutations are those on
+        its path to the root, whose expected length is 2(1 - 1/n) mean pairwise times. They are placed
+        before the SNPs and indels, which then keep clear of them as of TE events, so a duplication
+        copies the sequence its carriers hold. They are written to <prefix>.background_sv.vcf.
+
         Background stays --bg-margin bp clear of every TE event, so a TSD and the sequence an
         allele is scored on are the reference's, and is written to <prefix>.background.vcf, not
         the TE truth. It draws from a stream of its own, so the TE events, their genotypes and
         their TSDs are what they would have been without it.
         """
-        if not self.bg_pi:
+        if not (self.bg_pi or self.bg_sv_rate):
             return
         rng = np.random.default_rng(None if self.random_seed is None else self.random_seed + 7919)
         mu = self.bg_pi / 2          # pairwise diversity = 2 * mutation rate * mean pairwise time (1)
+        n_genomes = self.num_genomes
+        mu_sv = self.bg_sv_rate / 1e6 / (2 * (1 - 1 / n_genomes)) if n_genomes > 1 else self.bg_sv_rate / 1e6
+        log_lo, log_hi = np.log(self.bg_sv_min), np.log(self.bg_sv_max + 1)
+        n_sv = 0
         BASES = "ACGT"
         n_bg = 0
         for chrom, info in self.CHR.items():
             seq, L = info["seq"], info["len"]
             blocked = sorted((max(0, e["start"] - self.bg_margin), min(L, e["end"] + self.bg_margin))
                              for e in info["events"])
-            candidates = []
+            candidates, sv_candidates = [], []
             for b0 in range(1, L, self.bg_block):
                 b1 = min(L - 1, b0 + self.bg_block)
                 if b1 <= b0:
@@ -535,13 +554,48 @@ class Simulator:
                 branches = self._genealogy(self.num_genomes, rng)
                 lengths = np.array([b[0] for b in branches])
                 m = rng.poisson(mu * (b1 - b0) * lengths.sum())
-                if m == 0:
-                    continue
-                picks = rng.choice(len(branches), size=m, p=lengths / lengths.sum())
-                for pos, br in zip(rng.integers(b0, b1, size=m), picks):
-                    candidates.append((int(pos), branches[br][1]))
+                if m > 0:
+                    picks = rng.choice(len(branches), size=m, p=lengths / lengths.sum())
+                    for pos, br in zip(rng.integers(b0, b1, size=m), picks):
+                        candidates.append((int(pos), branches[br][1]))
+                if mu_sv:
+                    # Drawn only when asked for, so a run without SVs consumes the stream as before.
+                    m_sv = rng.poisson(mu_sv * (b1 - b0) * lengths.sum())
+                    if m_sv:
+                        picks = rng.choice(len(branches), size=m_sv, p=lengths / lengths.sum())
+                        sizes = np.exp(rng.uniform(log_lo, log_hi, size=m_sv)).astype(int)
+                        dups = rng.random(m_sv) < self.bg_sv_dup_frac
+                        for pos, br, size, dup in zip(rng.integers(b0, b1, size=m_sv), picks, sizes, dups):
+                            sv_candidates.append((int(pos), int(size), bool(dup), branches[br][1]))
             candidates.sort(key=lambda c: c[0])
             added, gts = [], []
+            # Structural variants first: each keeps --bg-margin from TE events and from the others,
+            # and its span joins the blocked set the SNPs and indels then keep clear of.
+            sv_spans = []
+            for pos, size, dup, carriers in sorted(sv_candidates, key=lambda c: c[0]):
+                lo, hi = pos, pos + size
+                if lo < 1 or hi > L - 1 or "N" in seq[lo - 1:hi]:
+                    continue
+                span = (lo - self.bg_margin, hi + self.bg_margin)
+                if any(a < span[1] and span[0] < b for a, b in blocked) or \
+                        any(a < span[1] and span[0] < b for a, b in sv_spans):
+                    continue
+                sv_spans.append((lo - self.bg_margin, hi + self.bg_margin))
+                if dup:
+                    # A tandem duplication: a copy of [lo, hi) inserted right after it.
+                    event = {"start": hi, "end": hi, "type": "INS", "ref": seq[hi - 1],
+                             "alt": seq[hi - 1] + seq[lo:hi], "sv_kind": "DUP"}
+                else:
+                    event = {"start": lo, "end": hi, "type": "DEL", "ref": seq[lo - 1:hi],
+                             "alt": seq[lo - 1], "sv_kind": "DEL"}
+                event.update({"chrom": chrom, "te_id": f"bgSV_{event['sv_kind']}", "strand": "+",
+                              "ltr_len": None, "tsd_len": 0, "background": True, "bg_sv": True,
+                              "sv_lo": lo, "sv_hi": hi})
+                added.append(event)
+                gts.append(carriers.astype(int))
+                n_sv += 1
+            if sv_spans:
+                blocked = sorted(blocked + sv_spans)
             prev_end, bi = -1, 0
             for pos, carriers in candidates:
                 r = rng.random()
@@ -582,14 +636,18 @@ class Simulator:
             info["events"] = [r[0] for r in rows]
             info["genotypes"] = np.array([r[1] for r in rows], dtype=int).reshape(len(rows), self.num_genomes)
             n_bg += len(added)
-        print(f"[INFO] Added {n_bg} background variants (pairwise diversity {self.bg_pi}/bp, "
+        print(f"[INFO] Added {n_bg - n_sv} background variants (pairwise diversity {self.bg_pi}/bp, "
               f"{self.bg_indel_frac:.0%} indels), written to {self.output_prefix}.background.vcf",
               file=sys.stderr)
+        if self.bg_sv_rate:
+            print(f"[INFO] Added {n_sv} background SVs ({self.bg_sv_rate}/genome/Mb against the reference, "
+                  f"{self.bg_sv_min}-{self.bg_sv_max} bp, {self.bg_sv_dup_frac:.0%} duplications), written to "
+                  f"{self.output_prefix}.background_sv.vcf", file=sys.stderr)
 
     def generate_background_vcf(self):
         """The background variants (_add_background, and TErandom --nSV's), apart from the TE truth."""
         events = [(chrom, i, e) for chrom, info in self.CHR.items()
-                  for i, e in enumerate(info["events"]) if e.get("background")]
+                  for i, e in enumerate(info["events"]) if e.get("background") and not e.get("bg_sv")]
         if not events:
             return
         outprefix = os.path.basename(self.output_prefix)
@@ -609,6 +667,42 @@ class Simulator:
                 pos = e["start"] + 1 if e["type"] == "SNP" else e["start"]
                 vcf.write(f"{chrom}\t{pos}\t{e['te_id']}\t{e['ref']}\t{e['alt']}\t.\tPASS\tTYPE={e['type']}\tGT\t"
                           + "\t".join(genotypes) + "\n")
+
+    def generate_background_sv_vcf(self):
+        """The background structural variants (--bg-sv-rate), apart from the TE truth and the small background:
+        what Evaluate --background_sv counts a caller's records against. A duplication's record sits at the
+        end of the stretch it copies, its ALT the anchor base plus the copy; INFO/DUPSTART is where the copied
+        stretch starts."""
+        events = [(chrom, i, e) for chrom, info in self.CHR.items()
+                  for i, e in enumerate(info["events"]) if e.get("bg_sv")]
+        if not events:
+            return
+        outprefix = os.path.basename(self.output_prefix)
+        path = f"{self.output_prefix}.background_sv.vcf"
+        with open(path, "w") as vcf:
+            vcf.write("##fileformat=VCFv4.2\n")
+            for chrom in self.CHR:
+                vcf.write(f"##contig=<ID={chrom},length={self.CHR[chrom]['len']}>\n")
+            vcf.write('##INFO=<ID=TYPE,Number=1,Type=String,Description="Background structural variant: DEL, or DUP '
+                      '(a tandem duplication); not a TE event">\n')
+            vcf.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Net length change">\n')
+            vcf.write('##INFO=<ID=DUPSTART,Number=1,Type=Integer,Description="DUP only: 1-based first base of the '
+                      'copied stretch, which ends at POS">\n')
+            vcf.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+            samples = [f"{outprefix}_{i}" for i in range(self.num_genomes)]
+            vcf.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(samples) + "\n")
+            n = 0
+            for chrom, idx, e in events:
+                genotypes = list(map(str, self.CHR[chrom]["genotypes"][idx]))
+                if all(g == "0" for g in genotypes):
+                    continue
+                n += 1
+                info = f"TYPE={e['sv_kind']};SVLEN={len(e['alt']) - len(e['ref'])}"
+                if e["sv_kind"] == "DUP":
+                    info += f";DUPSTART={e['sv_lo'] + 1}"
+                vcf.write(f"{chrom}\t{e['start']}\tbgSV_{e['sv_kind']}_{n}\t{e['ref']}\t{e['alt']}\t.\tPASS\t{info}\tGT\t"
+                          + "\t".join(genotypes) + "\n")
+        print(f"[INFO] {n} segregating background SV(s) written to {path}", file=sys.stderr)
 
     def generate_nonmobilizing_vcf(self):
         """The non-mobilizing SVs (TErandom --nNM), apart from the TE truth: what Evaluate --nonmobilizing
