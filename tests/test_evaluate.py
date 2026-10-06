@@ -965,6 +965,23 @@ def test_carrier_info_on_a_reference_held_element_marks_its_absence():
     print("PASS test_carrier_info_on_a_reference_held_element_marks_its_absence")
 
 
+def test_carrier_info_counts_an_excision_solo_ltr_as_the_event():
+    """An excision: the reference holds the element, and the ALT keeps a solo LTR that ME_INFO marks. That remnant
+    allele carries the event; an ALT holding the whole element with a SNP does not."""
+    samples = ["S0", "S1", "S2"]
+    ltr = ELEMENT[:300]
+    excision = (1000, "EXC-chrT-1000-6929-300-LTR/Copia-TY1-FULL", ANCHOR + ELEMENT, [ANCHOR + ltr],
+                "TYPE=EXC;EVENTTYPE=EXC", ["1", "0", "0"])
+    snp = ELEMENT[:-1] + ("A" if ELEMENT[-1] != "A" else "C")
+    me_info = (f"ME_INFO=chrT/1/{1 + len(ELEMENT)}/TY1,chrT_0/1/301/TY1,chrT_2/1/{1 + len(ELEMENT)}/TY1")
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [excision], samples,
+                    [(1000, "1.1", ANCHOR + ELEMENT, [ANCHOR + ltr, ANCHOR + snp], me_info, ["1", "0", "2"])],
+                    carrier_info="ME_INFO")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+    print("PASS test_carrier_info_counts_an_excision_solo_ltr_as_the_event")
+
+
 
 # ---- sequence check (--reference) ---------------------------------------------
 #
@@ -1128,6 +1145,7 @@ if __name__ == "__main__":
     test_carrier_info_marks_which_alts_are_carrier_alleles()
     test_carrier_info_on_a_single_alt_record_is_presence()
     test_carrier_info_on_a_reference_held_element_marks_its_absence()
+    test_carrier_info_counts_an_excision_solo_ltr_as_the_event()
     test_a_call_anchored_before_the_tsd_is_haplotype_identical()
     test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence()
     test_one_wrong_base_inside_the_element_is_not_identical()
