@@ -1100,6 +1100,58 @@ def add_unmatched(counts, unmatched_records):
     counts["all"].update(with_rates(counts["all"]))
 
 
+def load_nonmobilizing(vcf_file):
+    '''The non-mobilizing SVs Simulate wrote (TErandom --nNM), one dict per record: its span, kind
+    and carrier count.'''
+    sites = []
+    vcf = pysam.VariantFile(vcf_file)
+    for record in vcf:
+        carriers = sum(1 for s in record.samples.values()
+                       if any(a not in (None, 0) for a in (s.get("GT") or ())))
+        sites.append(OrderedDict([
+            ("chrom", record.chrom), ("pos", record.pos), ("end", record.pos + len(record.ref) - 1),
+            ("id", record.id), ("kind", record.info.get("NMKIND", ".")),
+            ("host", record.info.get("NMHOST", ".")), ("n_carriers", carriers)]))
+    return sites
+
+
+def score_nonmobilizing(sites, unmatched_records, max_dist):
+    '''
+    The calls a caller made at non-mobilizing SVs. A call that matched no simulated locus and whose
+    span comes within max_dist of one is charged to it. Those calls are already locus FPs (they
+    are unmatched predictions); this says how many there are and at which kinds of SV, since a
+    TE caller that reports one is mistaking a variant no TE made for a TE event. A displaced call
+    is left out, as it is from the FPs.
+    '''
+    by_chrom = {}
+    for k, site in enumerate(sites):
+        by_chrom.setdefault(site["chrom"], []).append((site["pos"] - max_dist, site["end"] + max_dist, k))
+    calls_at = {}
+    n_calls = 0
+    for r in unmatched_records:
+        if r.displaced_for is not None:
+            continue
+        end = max(r.span_end or r.pos, r.pos + len(r.ref or "N") - 1)
+        hits = [k for lo, hi, k in by_chrom.get(r.chrom, ()) if r.pos <= hi and end >= lo]
+        if hits:
+            n_calls += 1
+        for k in hits:
+            calls_at.setdefault(k, []).append(f"{r.chrom}:{r.pos}:{r.id}")
+    kinds = OrderedDict()
+    for k, site in enumerate(sites):
+        row = kinds.setdefault(site["kind"], OrderedDict([("sites", 0), ("sites_called", 0), ("calls", 0)]))
+        row["sites"] += 1
+        row["sites_called"] += k in calls_at
+        row["calls"] += len(calls_at.get(k, ()))
+    return OrderedDict([
+        ("sites", len(sites)),
+        ("sites_called", len(calls_at)),
+        ("calls", n_calls),
+        ("by_kind", kinds),
+        ("called", [OrderedDict(list(sites[k].items()) + [("calls", calls_at[k])]) for k in sorted(calls_at)]),
+    ])
+
+
 def stratify(scored_events, key):
     '''Group events by ``key(event)`` and aggregate each group. Sorted by group size.'''
     return stratify_multi(scored_events, lambda event: (key(event),))
@@ -1326,6 +1378,20 @@ def format_report(summary, meta, title="tevarsim Evaluate", preamble=()):
         if len(unsupported) > 5:
             lines.append(f"  ... and {len(unsupported) - 5} more")
 
+    nm = summary.get("nonmobilizing")
+    if nm is not None:
+        lines.append("")
+        lines.append(f"Non-mobilizing SVs ({nm['sites']} in {meta.get('nonmobilizing')})")
+        lines.append("  deletions that cut into or swallow a reference element by no TE mechanism; a TE caller should")
+        lines.append("  call none. A call on none of the simulated loci that comes within --max_dist of one is charged")
+        lines.append("  to it, and is among the unmatched predictions above")
+        lines.append(f"  sites called         : {nm['sites_called']} / {nm['sites']}"
+                     f"  ({_pct(nm['sites_called'] / nm['sites'] if nm['sites'] else None)})")
+        lines.append(f"  calls at them        : {nm['calls']} of the {summary['predictions']['unmatched']} unmatched predictions")
+        lines.extend(_table(["kind", "sites", "called", "calls"],
+                            [[kind, row["sites"], row["sites_called"], row["calls"]]
+                             for kind, row in nm["by_kind"].items()]))
+
     for title, key in STRATUM_TITLES:
         strata = summary.get(key)
         if not strata:
@@ -1361,6 +1427,8 @@ class Evaluator:
         self.af_bins = tuple(getattr(args, "af_bins", None) or DEFAULT_AF_BINS)
         self.no_html = getattr(args, "no_html", False)
         self.reference = getattr(args, "reference", None)
+        self.nonmobilizing_file = getattr(args, "nonmobilizing", None)
+        self.nonmobilizing = load_nonmobilizing(self.nonmobilizing_file) if self.nonmobilizing_file else None
 
     def _summarize(self, scored, records, truth_samples):
         '''Every summary table for one scoring of the loci; also returns the unmatched records.'''
@@ -1408,6 +1476,8 @@ class Evaluator:
         summary["by_allele_frequency"] = _order_bins(
             stratify(scored, lambda e: af_bin(e["allele_frequency"], self.af_bins)),
             _af_bin_labels(self.af_bins))
+        if self.nonmobilizing is not None:
+            summary["nonmobilizing"] = score_nonmobilizing(self.nonmobilizing, unmatched_records, self.max_dist)
         if len(truth_samples) <= MAX_GENOMES_FOR_CARRIER_TABLE:
             summary["by_carrier_count"] = OrderedDict(sorted(
                 stratify(scored, lambda e: e["n_carrier_genomes"]).items(),
@@ -1488,6 +1558,7 @@ class Evaluator:
             ("nHap", self.nHap),
             ("carrier_info", self.carrier_info),
             ("reference", self.reference),
+            ("nonmobilizing", self.nonmobilizing_file),
             ("size_bins", list(self.size_bins)),
             ("af_bins", list(self.af_bins)),
         ])

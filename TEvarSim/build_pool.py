@@ -55,6 +55,9 @@ class TEtype(list):
 # 1.6kb pseudo-element leaving a 280bp "solo LTR".
 MIN_INTERNAL_COVERAGE = 0.5
 
+# Kinds of non-mobilizing SV (TErandom --nNM), in the order --nmKinds lists them by default.
+NM_KINDS = ("internal", "left", "right", "tight", "wide")
+
 
 def ltr_element_core(te_info):
     """The LTR-I-LTR span of a full-length LTR element, and its 5' LTR length.
@@ -254,6 +257,17 @@ class RandomTE:
         self.DELlen = args.DELlen
         self.TEdistance = args.TEdistance
         self.nSV = args.nSV # number of background SVs
+        # Non-mobilizing SVs (select_NM). Read with defaults so callers that build their own args
+        # object need not know about them. Drawn from a stream of their own, so asking for them
+        # moves none of the deletions, excisions or insertions a run would otherwise have made.
+        self.nNM = getattr(args, "nNM", 0) or 0
+        self.nm_kinds = [k for k in (getattr(args, "nmKinds", None) or ",".join(NM_KINDS)).split(",") if k]
+        self.nm_internal = getattr(args, "nmInternal", (100, 1500))
+        self.nm_straddle_flank = getattr(args, "nmStraddleFlank", (25, 2000))
+        self.nm_tight_flank = getattr(args, "nmTightFlank", (25, 250))
+        self.nm_wide_flank = getattr(args, "nmWideFlank", (250, 5000))
+        self.nm_margin = getattr(args, "nmMargin", 50)
+        self.NM = []
         self.nMIN = args.nMIN # minimum number of TEs for each family
         self.random_seed = args.seed
         if self.random_seed is not None:
@@ -286,16 +300,19 @@ class RandomTE:
         nplaced = self.nDEL + self.nINS
         if self.nMIN > 0 and self.nMIN >= nplaced:
             raise ValueError(f"minimum number of a TE family ({self.nMIN}) should be less than nDEL+nINS ({nplaced})")
+        nm_hosts = list(self.DEL)    # every candidate left once the excisions are out; see select_NM
         if self.nMIN > 0:
             self.DEL = make_min_TE(self.DEL, self.nMIN, self.nDEL, self.TEtype, self.target_strands[:self.nDEL])
         else:
             self.DEL = pick_stranded(self.DEL, self.nDEL, self.target_strands[:self.nDEL])
-        # 4. place insertions (avoiding both selected DEL and EXC spans)
+        # 4. non-mobilizing SVs, on elements neither deleted nor excised
+        self.select_NM(nm_hosts)
+        # 5. place insertions (avoiding the selected DEL, EXC and NM spans)
         self.parse_TEpool()
-        # 5. Generate BED file
+        # 6. Generate BED file
         self.build_bed()
         logging.info(f"Generated TE BED file: {self.prefix}.bed")
-        # 6. Add background SVs if specified
+        # 7. Add background SVs if specified
         if self.nSV > 0:
             bedin = self.prefix + ".bed"
             bedout = self.prefix + ".bgSV.bed"
@@ -324,9 +341,92 @@ class RandomTE:
         self.DEL = [d for d in self.DEL if not any(d[1] < e and s < d[2] for s, e in by_chrom.get(d[0], []))]
         self.EXC = chosen
 
+    def select_NM(self, hosts):
+        """Choose nNM non-mobilizing SVs: deletions that take part or all of a reference element and
+        none of which any TE mechanism makes, so a TE caller should call none of them.
+
+            internal  both ends inside the element, at most half of it: not a truncation (neither end
+                      is the element's), not an excision (an LTR-LTR recombination removes all but one
+                      LTR), not a presence/absence (part of an element, no TSD)
+            left      from the left flank into the element
+            right     from inside the element into the right flank
+            tight     the whole element and a short stretch of flank either side, each longer than any
+                      TSD, so it is not the element's own presence/absence
+            wide      the whole element and kilobases of flank: a large deletion that swallows it
+
+        Every breakpoint inside an element keeps --nmMargin from its ends. The hosts are the deletion
+        candidates no deletion or excision took, one SV per host; an SV may take further flank and
+        whatever reference elements lie in it, but overlaps no deleted or excised element and no other
+        non-mobilizing SV (Simulate takes non-overlapping events only) and stays inside --regions minus
+        --exclude. The kinds are dealt out in turn from a shuffled host list; a host that cannot hold
+        its kind is passed over for that kind.
+        """
+        self.NM = []
+        if self.nNM == 0:
+            return
+        rnd = random.Random(None if self.random_seed is None else self.random_seed + 4241)
+        taken = sorted((d[0], d[1], d[2]) for d in self.DEL + self.EXC)
+        taken_by_chrom = {}
+        for c, s, e in taken:
+            taken_by_chrom.setdefault(c, []).append((s, e))
+        # Allowed space: any region, either strand (the strand copies of a region are the same span).
+        allowed = {}
+        for r in self.regions:
+            allowed.setdefault(r[0], set()).add((int(r[1]), int(r[2])))
+        chosen_spans = {}
+        m = self.nm_margin
+
+        def fits(chrom, s, e):
+            if not any(a <= s and e <= b for a, b in allowed.get(chrom, ())):
+                return False
+            for a, b in taken_by_chrom.get(chrom, ()) + chosen_spans.get(chrom, []):
+                if s < b + 1 and a < e + 1:     # neither overlapping nor abutting
+                    return False
+            return True
+
+        def draw(kind, lo, hi):
+            n = hi - lo
+            if kind == "internal":
+                longest = min(self.nm_internal[1], n // 2, n - 2 * m)
+                if longest < self.nm_internal[0]:
+                    return None
+                length = rnd.randint(self.nm_internal[0], longest)
+                s = rnd.randint(lo + m, hi - m - length)
+                return s, s + length
+            if kind in ("left", "right"):
+                if n < 2 * m + 1:
+                    return None
+                cut = rnd.randint(lo + m, hi - m)
+                flank = rnd.randint(*self.nm_straddle_flank)
+                return (lo - flank, cut) if kind == "left" else (cut, hi + flank)
+            flanks = self.nm_tight_flank if kind == "tight" else self.nm_wide_flank
+            return lo - rnd.randint(*flanks), hi + rnd.randint(*flanks)
+
+        pool = sorted(hosts)
+        rnd.shuffle(pool)
+        kinds = [self.nm_kinds[i % len(self.nm_kinds)] for i in range(self.nNM)]
+        for kind in kinds:
+            for i, h in enumerate(pool):
+                chrom, lo, hi, host_id, rep_class = h[0], h[1], h[2], h[3], h[4]
+                span = draw(kind, lo, hi)
+                if span is None or not fits(chrom, *span):
+                    continue
+                pool.pop(i)
+                chosen_spans.setdefault(chrom, []).append(span)
+                host = host_id[4:] if host_id.startswith("DEL-") else host_id
+                self.NM.append((chrom, span[0], span[1], f"NM-{kind}-{host}", rep_class, "NM", "."))
+                break
+        if len(self.NM) < self.nNM:
+            raise ValueError(
+                f"Requested {self.nNM} non-mobilizing SVs but only {len(self.NM)} could be placed on the "
+                f"{len(hosts)} --existingTEs element(s) left after the deletions and excisions. Lower --nNM, "
+                f"supply more candidates, or narrow the flank ranges.")
+        counts = {k: kinds.count(k) for k in self.nm_kinds}
+        logging.info(f"Placed {len(self.NM)} non-mobilizing SVs: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+
     def build_bed(self):
-        # merge INS, DEL and EXC
-        merged = self.INS + self.DEL + self.EXC
+        # merge INS, DEL, EXC and NM
+        merged = self.INS + self.DEL + self.EXC + self.NM
         merged.sort()
         # bedfile output
         bed_name = self.prefix + ".bed"
@@ -512,7 +612,7 @@ class RandomTE:
         # Guard against lst[-0:] == lst[0:] (whole list); explicitly take the last nINS entries.
         ins_strands = self.target_strands[-self.nINS:]
         # Insertions must avoid both selected deletion and excision spans.
-        exclusion = self.DEL + self.EXC
+        exclusion = self.DEL + self.EXC + self.NM
         INSpos = sample_TEins(self.regions, exclusion, self.nINS, TEdistance=self.TEdistance, target_strands=ins_strands)
         for record, (chrom, pos, strand) in zip(records,INSpos):
             self.INS.append((chrom, pos, pos, record.id, record.id.split("/")[1], "INS", strand))

@@ -21,6 +21,14 @@ class ratio(float):
             raise ValueError(f"Rate or ratio must be between 0 and 1: {value}")
         return self
 
+def int_range(value: str):
+    """MIN-MAX (or one number for both) as a pair of non-negative ints, MIN <= MAX."""
+    lo, _, hi = value.partition("-")
+    lo, hi = int(lo), int(hi or lo)
+    if not 0 <= lo <= hi:
+        raise ValueError(f"Must be MIN-MAX with 0 <= MIN <= MAX: {value}")
+    return lo, hi
+
 class File_Path(str):
     def __new__(self, value: str):
         return super().__new__(self, os.path.abspath(value))
@@ -87,7 +95,33 @@ def main():
                     help="BED of full-length LTR elements eligible for excision: chrom, start, end (the element alone, "
                          "no TSD), name#class/family, score, strand, and the 5' LTR length in a 7th column. A deletion "
                          "candidate overlapping an element chosen for excision is not deleted as well")
-    TErandom_parser.add_argument("--outprefix", "-O", type=File_Path, default="TErandom", 
+    TErandom_parser.add_argument("--nNM", type=int, default=0,
+                    help="Number of non-mobilizing SVs: deletions that cut into or swallow an --existingTEs element "
+                         "but are no TE mechanism, so a TE caller should call none of them. Their hosts are elements "
+                         "left over after the deletions and excisions are chosen; each gets one kind from --nmKinds, "
+                         "in equal shares. Simulate writes them into the genomes and into <outprefix>.nonmobilizing.vcf, "
+                         "never into the TE truth, and Evaluate --nonmobilizing counts the calls made at them (default: 0)")
+    TErandom_parser.add_argument("--nmKinds", type=str, default=",".join(build_pool.NM_KINDS),
+                    help="Comma-separated kinds of non-mobilizing SV: internal (inside the element, both ends in it), "
+                         "left (from the left flank into the element), right (from inside the element into the right "
+                         "flank), tight (the whole element and a little flank either side), wide (the whole element "
+                         "and a lot of flank) (default: all five)")
+    TErandom_parser.add_argument("--nmInternal", type=int_range, default=(100, 1500), metavar="MIN-MAX",
+                    help="Length of an internal non-mobilizing deletion, in bp; never more than half the element "
+                         "(default: 100-1500)")
+    TErandom_parser.add_argument("--nmStraddleFlank", type=int_range, default=(25, 2000), metavar="MIN-MAX",
+                    help="Flank taken by a left or right non-mobilizing deletion, in bp (default: 25-2000)")
+    TErandom_parser.add_argument("--nmTightFlank", type=int_range, default=(25, 250), metavar="MIN-MAX",
+                    help="Flank taken on each side by a tight non-mobilizing deletion, drawn per side, in bp. Kept "
+                         "above the longest TSD so it never reads as the element's own presence/absence "
+                         "(default: 25-250)")
+    TErandom_parser.add_argument("--nmWideFlank", type=int_range, default=(250, 5000), metavar="MIN-MAX",
+                    help="Flank taken on each side by a wide non-mobilizing deletion, drawn per side, in bp "
+                         "(default: 250-5000)")
+    TErandom_parser.add_argument("--nmMargin", type=int, default=50,
+                    help="A breakpoint inside the element stays at least this many bp from either of its ends "
+                         "(default: 50)")
+    TErandom_parser.add_argument("--outprefix", "-O", type=File_Path, default="TErandom",
                     help="Output prefix for the generated TE pool FASTA file and the bed file (default: TErandom)")
     TErandom_parser.add_argument("--DELlen", type=int, default=100,
                     help="A minimum length of known TE deletions to be considered for simulating pTE deletions (default: 100 bp)")
@@ -363,6 +397,11 @@ def main():
                          "any other field marks the ALT by being present and not '.' (e.g. GraffiTE's "
                          "repeat_ids). Without it, a multi-allelic call's carriers are inferred from allele "
                          "lengths and the simulated neighbours each genome carries")
+    Evaluate_parser.add_argument("--nonmobilizing", type=Existing_File_Path, default=None, metavar="VCF",
+                    help="Simulate's <outprefix>.nonmobilizing.vcf (TErandom --nNM): deletions that cut into or swallow "
+                         "a reference element by no TE mechanism. Reports how many of them the prediction called, by kind: "
+                         "every unmatched call within --max_dist of one is charged to it. Those calls stay unmatched "
+                         "predictions, so they count against precision either way")
     Evaluate_parser.add_argument("--size_bins", type=int, action="append", default=None,
                     help="Upper edges (bp) of the event-size strata; repeat the flag per edge "
                          f"(default: {' '.join(map(str, evaluate.DEFAULT_SIZE_BINS))})")
@@ -414,11 +453,19 @@ def main():
     if args.command in ("TErandom", "TEreal", "TEpan"):
         if args.nINS < 0 or args.nDEL < 0 or args.nEXC < 0:
             parser.error("--nINS, --nDEL, and --nEXC must be non-negative.")
-        if args.nINS + args.nDEL + args.nEXC == 0:
-            parser.error("Nothing to simulate: set at least one of --nINS, --nDEL, --nEXC to a value > 0.")
+        if args.nINS + args.nDEL + args.nEXC + getattr(args, "nNM", 0) == 0:
+            parser.error("Nothing to simulate: set at least one of --nINS, --nDEL, --nEXC, --nNM to a value > 0.")
     if args.command == "TErandom":
         if args.nDEL > 0 and not args.existingTEs:
             TErandom_parser.error("--existingTEs is required when --nDEL > 0.")
+        if args.nNM < 0:
+            TErandom_parser.error("--nNM must be non-negative.")
+        if args.nNM > 0 and not args.existingTEs:
+            TErandom_parser.error("--existingTEs is required when --nNM > 0: its elements host the non-mobilizing SVs.")
+        if args.nNM > 0:
+            bad = [k for k in args.nmKinds.split(",") if k not in build_pool.NM_KINDS]
+            if bad or not args.nmKinds:
+                TErandom_parser.error(f"--nmKinds takes a comma-separated subset of {','.join(build_pool.NM_KINDS)} (got '{args.nmKinds}')")
         if args.nEXC > 0 and not (args.existingTEs or args.excCandidates):
             TErandom_parser.error("--existingTEs or --excCandidates is required when --nEXC > 0.")
         if args.nEXC > 0 and not args.excCandidates and not str(args.existingTEs).lower().endswith(".out"):

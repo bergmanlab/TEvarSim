@@ -121,6 +121,7 @@ class Simulator:
         self._add_background()
         self.generate_vcf()
         self.generate_background_vcf()
+        self.generate_nonmobilizing_vcf()
         self.generate_genome()
 
     def _check_bed(self):
@@ -201,7 +202,8 @@ class Simulator:
                     else:
                         ltr_len = int(te_id.split("-")[4])
                 else:
-                    event_type = "INS" if end-start <= 1 else "DEL"
+                    # A non-mobilizing SV (TErandom --nNM) is a deletion of whatever span it names.
+                    event_type = "INS" if end-start <= 1 and not te_id.startswith("NM-") else "DEL"
                 self.TEevents.append({
                     "chrom":chrom,
                     "start": start,
@@ -212,6 +214,8 @@ class Simulator:
                     "ltr_len": ltr_len,
                     # TErandom --nSV's synthetic INS/DEL: in the genomes, but not TE truth.
                     "background": te_id.startswith("bg"),
+                    # TErandom --nNM: in the genomes, in <prefix>.nonmobilizing.vcf, never TE truth.
+                    "nonmobilizing": te_id.startswith("NM-"),
                 })
         print(f"[INFO] Parsed {len(self.TEevents)} TE events from BED.",file=sys.stderr)
         print(f"[INFO] Example event: {self.TEevents[0] if self.TEevents else 'No events'}",file=sys.stderr)
@@ -279,8 +283,11 @@ class Simulator:
         """
         n = len(events)
         afs = np.empty(n, dtype=float)
-        del_idx = [i for i, e in enumerate(events) if e["type"] == "DEL"]
-        other_idx = [i for i, e in enumerate(events) if e["type"] != "DEL"]
+        # A non-mobilizing SV is a deletion, but a new mutation rather than the absence of a
+        # reference element, so it is rare like an insertion: GT=1 is the derived state.
+        is_del = [e["type"] == "DEL" and not e.get("nonmobilizing") for e in events]
+        del_idx = [i for i, d in enumerate(is_del) if d]
+        other_idx = [i for i, d in enumerate(is_del) if not d]
         if other_idx:
             afs[other_idx] = self._draw_afs(len(other_idx))
         if del_idx:
@@ -379,7 +386,7 @@ class Simulator:
             # keep the flag-driven length -- exactly where it was. A header RANGE needs a
             # number of its own, so it takes one from the auxiliary stream instead.
             tsd_len = np.random.randint(self.tsd_min, self.tsd_max + 1)
-            if te_id.startswith("bg"):
+            if te_id.startswith("bg") or event["nonmobilizing"]:
                 # Background SVs are synthetic sequence with no element behind them, so they
                 # duplicate nothing. Checked before the header lookup so they neither pick up
                 # a tag nor turn up in the untagged warning: bgSV writes them into the pool
@@ -603,6 +610,42 @@ class Simulator:
                 vcf.write(f"{chrom}\t{pos}\t{e['te_id']}\t{e['ref']}\t{e['alt']}\t.\tPASS\tTYPE={e['type']}\tGT\t"
                           + "\t".join(genotypes) + "\n")
 
+    def generate_nonmobilizing_vcf(self):
+        """The non-mobilizing SVs (TErandom --nNM), apart from the TE truth: what Evaluate --nonmobilizing
+        counts a caller's records against. Written only when the BED holds any."""
+        events = [(chrom, i, e) for chrom, info in self.CHR.items()
+                  for i, e in enumerate(info["events"]) if e.get("nonmobilizing")]
+        if not events:
+            return
+        outprefix = os.path.basename(self.output_prefix)
+        path = f"{self.output_prefix}.nonmobilizing.vcf"
+        with open(path, "w") as vcf:
+            vcf.write("##fileformat=VCFv4.2\n")
+            for chrom in self.CHR:
+                vcf.write(f"##contig=<ID={chrom},length={self.CHR[chrom]['len']}>\n")
+            vcf.write('##INFO=<ID=TYPE,Number=1,Type=String,Description="Variant type: DEL, a deletion that cuts into or '
+                      'swallows a reference element by no TE mechanism (TErandom --nNM); a TE caller should call none">\n')
+            vcf.write('##INFO=<ID=NMKIND,Number=1,Type=String,Description="internal (inside the element), left (left flank '
+                      'into the element), right (element into the right flank), tight or wide (the whole element and a '
+                      'little or a lot of flank)">\n')
+            vcf.write('##INFO=<ID=NMHOST,Number=1,Type=String,Description="The reference element it cuts into or swallows: '
+                      'chrom-start-end-class/family-name, BED coordinates">\n')
+            vcf.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Net length change">\n')
+            vcf.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+            samples = [f"{outprefix}_{i}" for i in range(self.num_genomes)]
+            vcf.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(samples) + "\n")
+            n = 0
+            for chrom, idx, e in events:
+                genotypes = list(map(str, self.CHR[chrom]["genotypes"][idx]))
+                if all(g == "0" for g in genotypes):
+                    continue
+                _, kind, host = e["te_id"].split("-", 2)
+                vcf.write(f"{chrom}\t{e['start']}\t{e['te_id']}\t{e['ref']}\t{e['alt']}\t.\tPASS\t"
+                          f"TYPE=DEL;NMKIND={kind};NMHOST={host};SVLEN={len(e['alt']) - len(e['ref'])}\tGT\t"
+                          + "\t".join(genotypes) + "\n")
+                n += 1
+        print(f"[INFO] {n} segregating non-mobilizing SV(s) written to {path}", file=sys.stderr)
+
     def generate_vcf(self):
         """
         Generate a VCF file from parsed TE events with detailed INFO.
@@ -637,8 +680,8 @@ class Simulator:
 
             for chrom,chr_info in self.CHR.items():
                 for idx, event in enumerate(chr_info["events"]):
-                    if event.get("background"):
-                        continue    # written to the background VCF instead: not TE truth
+                    if event.get("background") or event.get("nonmobilizing"):
+                        continue    # written to the background or non-mobilizing VCF instead: not TE truth
                     genotypes = list(map(str, chr_info["genotypes"][idx]))
                     if all(g=="0" for g in genotypes):
                         continue
@@ -795,7 +838,8 @@ class Simulator:
                     if self.diverse:
                         # introduce sequence diversity for each TE-events (not background ones)
                         te_cols = {c for c, ev in zip(cols_to_replace, chr_info["gt_row"])
-                                   if not chr_info["events"][ev].get("background")}
+                                   if not (chr_info["events"][ev].get("background")
+                                           or chr_info["events"][ev].get("nonmobilizing"))}
                         mask_seq = [m if i in te_cols else 0 for i, m in enumerate(mask)]
                         if self.diverse_config:
                             divConfig = Get_config(self.diverse_config)

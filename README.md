@@ -122,6 +122,10 @@ Generate pTE position from known deletion sites and random TE insertion.
 - `nINS` : Number of random TE insertions to simulate (default: 0)
 - `nDEL` : Number of TE deletions to simulate from `--existingTEs` (default: 0)
 - `nEXC` : Number of LTR-LTR recombinations (excisions of full-length LTR elements) to simulate; requires a RepeatMasker `.out` `--existingTEs` file (default: 0)
+- `nNM` : Number of non-mobilizing SVs: deletions that cut into or swallow an `--existingTEs` element by no TE mechanism (default: 0). See below
+- `nmKinds` : Which kinds of non-mobilizing SV, comma-separated, dealt out in equal shares (default: `internal,left,right,tight,wide`)
+- `nmInternal / --nmStraddleFlank / --nmTightFlank / --nmWideFlank` : `MIN-MAX` lengths in bp: an internal deletion (100-1500, never more than half the element), the flank a left or right one takes (25-2000), and the flank a tight or wide one takes on each side (25-250, 250-5000)
+- `nmMargin` : A breakpoint inside an element stays this many bp from its ends (default: 50)
 - `outprefix` : Output prefix for TE pool FASTA (default: TErandom)
 - `TEtype` : Which TE super families to be extracted from the TE deletion file (default: Alu, L1, and SVA). Specify the TE type by `--TEtype Alu --TEtype L1`
 - `DELlen` : A minimum length of known TE deletions to be considered for simulating pTE deletions (default: 100 bp)
@@ -141,6 +145,24 @@ Generate pTE position from known deletion sites and random TE insertion.
 - `polyA-max` : Maximum polyA length (default: 20)
 - `seed` : Random seed (default: None)
 
+
+**Non-mobilizing SVs.** A TE caller sees every structural variant that involves an element, not
+only the ones a transposon made. `--nNM` adds such variants, deletions none of which any TE mechanism
+makes, each on a reference element (an `--existingTEs` candidate that no deletion or excision took):
+
+| kind | the deletion |
+| :--- | :--- |
+| `internal` | inside the element, neither end at the element's own: not a truncation, an excision or a presence/absence |
+| `left` | from the left flank into the element |
+| `right` | from inside the element into the right flank |
+| `tight` | the whole element and 25-250 bp of flank either side, more than any TSD |
+| `wide` | the whole element and 250-5000 bp of flank either side, taking whatever else lies there |
+
+Each is written to the BED as `NM-<kind>-<host element>`. Simulate puts them into the genomes, draws
+their allele frequencies from the insertion spec (they are new mutations, so rare), and writes them to
+`<outprefix>.nonmobilizing.vcf` rather than to the TE truth. `Evaluate --nonmobilizing` then counts
+the calls a caller made at them. They draw from a random stream of their own, so the deletions,
+excisions and insertions are those a run without them would make.
 
 ### 2. TEreal
 Automatically generate pTE positions from RepeatMasker or UCSC repeat annotations.
@@ -384,6 +406,9 @@ the events and so total more than the loci. No genome is named on the command li
   same locus (default: 100)
 - `gt_len_tol` : Maximum allowed difference (bp) in allele length to consider two alleles the same
   (default: 50)
+- `nonmobilizing` : Simulate's `<outprefix>.nonmobilizing.vcf`. Reports how many of the non-mobilizing
+  SVs the prediction called, by kind: every unmatched call within `--max_dist` of one is charged to it.
+  Those calls stay unmatched predictions, so they count against precision either way
 - `size_bins` : Upper edges (bp) of the element-size strata; repeat the flag per edge
   (default: 100 500 1000 5000 10000)
 - `af_bins` : Upper edges of the allele-frequency strata; repeat the flag per edge
