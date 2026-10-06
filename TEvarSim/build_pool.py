@@ -227,6 +227,7 @@ class RandomTE:
             self.regions = [[chr, 1, chr_len, ".", ".", strand]
                 for strand in ["+", "-"]
                 for chr, chr_len in self.CHR.items()]
+        self.excluded = {}   # chrom -> [(start, end)], from --exclude: what the non-mobilizing SVs avoid
         if args.exclude:
             try:
                 with open(args.exclude) as fin:
@@ -237,6 +238,7 @@ class RandomTE:
                 excluded_region = excluded_region.split("\t")
                 excluded_region[1] = int(excluded_region[1])
                 excluded_region[2] = int(excluded_region[2])
+                self.excluded.setdefault(excluded_region[0], []).append((excluded_region[1], excluded_region[2]))
                 new_regions = []
                 for region in self.regions:
                     if region[0] == excluded_region[0] and (len(excluded_region) < 6 or region[5] == excluded_region[5]):
@@ -357,8 +359,8 @@ class RandomTE:
         Every breakpoint inside an element keeps --nmMargin from its ends. The hosts are the deletion
         candidates no deletion or excision took, one SV per host; an SV may take further flank and
         whatever reference elements lie in it, but overlaps no deleted or excised element and no other
-        non-mobilizing SV (Simulate takes non-overlapping events only) and stays inside --regions minus
-        --exclude. The kinds are dealt out in turn from a shuffled host list; a host that cannot hold
+        non-mobilizing SV (Simulate takes non-overlapping events only) and stays out of --exclude.
+        --regions does not apply: it says where insertions go. The kinds are dealt out in turn from a shuffled host list; a host that cannot hold
         its kind is passed over for that kind.
         """
         self.NM = []
@@ -369,17 +371,15 @@ class RandomTE:
         taken_by_chrom = {}
         for c, s, e in taken:
             taken_by_chrom.setdefault(c, []).append((s, e))
-        # Allowed space: any region, either strand (the strand copies of a region are the same span).
-        allowed = {}
-        for r in self.regions:
-            allowed.setdefault(r[0], set()).add((int(r[1]), int(r[2])))
         chosen_spans = {}
         m = self.nm_margin
 
         def fits(chrom, s, e):
-            if not any(a <= s and e <= b for a, b in allowed.get(chrom, ())):
+            if chrom not in self.CHR or s < 1 or e > self.CHR[chrom]:
                 return False
-            for a, b in taken_by_chrom.get(chrom, ()) + chosen_spans.get(chrom, []):
+            if any(s < b and a < e for a, b in self.excluded.get(chrom, ())):
+                return False
+            for a, b in taken_by_chrom.get(chrom, []) + chosen_spans.get(chrom, []):
                 if s < b + 1 and a < e + 1:     # neither overlapping nor abutting
                     return False
             return True

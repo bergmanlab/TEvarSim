@@ -85,6 +85,18 @@ def test_nonmobilizing_svs():
         assert all(a[1] < b[0] or (a[0] == a[1] and a[1] <= b[0]) for a, b in zip(spans, spans[1:])), \
             "events overlap"
 
+        # --regions says where insertions go, not the SVs; --exclude keeps both out.
+        regions, exclude = os.path.join(d, "regions.bed"), os.path.join(d, "exclude.bed")
+        with open(regions, "w") as f:
+            f.write("chrT\t5000\t5500\nchrT\t390000\t399000\n")
+        with open(exclude, "w") as f:
+            f.write("chrT\t0\t200000\n")
+        out2 = os.path.join(d, "pool2")
+        _tevarsim("TErandom", "--ref", ref, "--consensus", lib, "--existingTEs", hosts, "--nINS", 2,
+                  "--nNM", 5, "--regions", regions, "--exclude", exclude, "--outprefix", out2, "--seed", 4)
+        nm2 = [l.split("\t") for l in open(out2 + ".bed") if "\tNM-" in l]
+        assert len(nm2) == 5 and all(int(r[1]) >= 200000 for r in nm2), nm2
+
         sim = os.path.join(d, "sim")
         _tevarsim("Simulate", "--ref", ref, "--bed", out + ".bed", "--pool", out + ".fa", "--num", 8,
                   "--af-dist", "uniform", "--af-min", 0.5, "--af-max", 0.5, "--tsd-from-header",
