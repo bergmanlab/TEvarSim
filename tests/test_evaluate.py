@@ -186,6 +186,29 @@ def test_one_prediction_cannot_cover_two_stacked_events():
     print("PASS test_one_prediction_cannot_cover_two_stacked_events")
 
 
+def test_a_tsd_in_ref_is_matched_along_its_span():
+    """Two insertions 5 bp apart, called the miniME way: POS at the start of the TSD copy REF holds, 4 bp left of
+    each simulated point of insertion. Each call stands for its whole TSD, so neither is paired across."""
+    samples = ["S0", "S1"]
+    t0, t1 = "CATTA", "TCAAT"
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"]), _ins(1005, ["0", "1"])], samples,
+                    [(996, "a", t0, [t0 + ELEMENT + t0], f"TSD={t0}", ["1", "0"]),
+                     (1001, "b", t1, [t1 + ELEMENT + t1], f"TSD={t1}", ["0", "1"])])
+        assert [l["match"]["id"] for l in ev.loci] == ["a", "b"], [l["match"] for l in ev.loci]
+        assert [l["match"]["pos_offset"] for l in ev.loci] == [0, 0], [l["match"] for l in ev.loci]
+    print("PASS test_a_tsd_in_ref_is_matched_along_its_span")
+
+
+def test_a_tsd_not_in_ref_leaves_the_call_at_pos():
+    """A TSD the REF allele does not start with says nothing about where the record's position is anchored."""
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, ["S0"], [_ins(1000, ["1"])], ["S0"],
+                    [(996, "a", ANCHOR, [ANCHOR + ELEMENT], "TSD=CATTA", ["1"])])
+        assert ev.loci[0]["match"]["pos_offset"] == -4, ev.loci[0]["match"]
+    print("PASS test_a_tsd_not_in_ref_leaves_the_call_at_pos")
+
+
 def test_allele_agreement_wins_over_proximity_when_pairing():
     """A nearer call of the wrong allele must not steal the event from the right one."""
     with tempfile.TemporaryDirectory() as d:
@@ -1091,6 +1114,8 @@ if __name__ == "__main__":
     test_a_short_allele_reads_negative_and_a_long_one_positive()
     test_a_prediction_beyond_max_dist_is_not_a_detection()
     test_one_prediction_cannot_cover_two_stacked_events()
+    test_a_tsd_in_ref_is_matched_along_its_span()
+    test_a_tsd_not_in_ref_leaves_the_call_at_pos()
     test_allele_agreement_wins_over_proximity_when_pairing()
     test_a_matched_call_of_the_wrong_allele_is_detected_but_not_concordant()
     test_a_stacked_call_is_not_the_same_allele_as_a_single_element()

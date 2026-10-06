@@ -120,6 +120,7 @@ class PredRecord:
         self.displaced_for = None     # the locus this call found at the wrong anchor
         self.index = None             # position in the prediction file
         self.carrier_alts = None      # --carrier_info: the ALT indices that are carrier alleles (None: not given)
+        self.span_end = pos           # last position the record stands for (see tsd_span_end)
 
 
 # ---- loading -----------------------------------------------------------------
@@ -404,6 +405,31 @@ def pred_is_carrier(record, gt):
     return is_carrier(gt, record.nonvariant)
 
 
+def tsd_span_end(pos, ref, info_text):
+    '''
+    The last position a prediction stands for: POS, unless its REF allele starts with the TSD its INFO names.
+
+    A caller that writes the TSD into REF (miniME: REF is the single copy of the target site, a carrier's ALT is
+    TSD + element + TSD) anchors POS at the start of that copy, while a simulated insertion sits at the point of
+    insertion past it -- the same event, TSD length - 1 bp apart. Such a record matches anywhere along
+    POS .. POS + len(TSD) - 1, so neighbouring insertions a few bp apart are not paired across.
+    '''
+    for item in info_text.split(";"):
+        name, _, val = item.partition("=")
+        if name == "TSD" and val and val != "." and ref.upper().startswith(val.upper()):
+            return pos + len(val) - 1
+    return pos
+
+
+def pred_offset(record, pos):
+    '''Signed distance of a prediction from a position: 0 inside the positions it stands for, else from the nearer
+    end, positive where the call lies to the right.'''
+    if pos < record.pos:
+        return record.pos - pos
+    end = getattr(record, "span_end", record.pos)
+    return end - pos if pos > end else 0
+
+
 def load_pred_vcf(vcf_file, carrier_info=None):
     '''
     Read the prediction VCF, keeping every record that any sample calls as a variant.
@@ -443,6 +469,7 @@ def load_pred_vcf(vcf_file, carrier_info=None):
                           tuple(record.alts or ()), gts, descs, alt_descs, nonvariant)
         pred.index = index
         pred.text = text
+        pred.span_end = tsd_span_end(record.pos, record.ref, text.split("\t")[7])
         if carrier_info:
             pred.carrier_alts = carrier_alleles(text.split("\t")[7], carrier_info, len(record.alts or ()))
         records.append(pred)
@@ -693,7 +720,7 @@ def match_events(events, records, max_dist, tol):
     candidates = []
     for i, event in enumerate(events):
         for j, record in enumerate(by_chrom.get(event.chrom, [])):
-            distance = abs(record.pos - event.pos)
+            distance = abs(pred_offset(record, event.pos))
             if distance > max_dist:
                 continue
             agree = alleles_overlap(event.alt_descs, record.alt_descs, tol)
@@ -763,7 +790,7 @@ def match_displaced(events, by_chrom, taken_events, taken_records, max_dist, tol
         for j, record in enumerate(by_chrom.get(event.chrom, [])):
             if (event.chrom, j) in taken_records:
                 continue
-            distance = abs(record.pos - expected)
+            distance = abs(pred_offset(record, expected))
             if distance > max_dist:
                 continue
             agree = alleles_overlap(event.alt_descs, record.alt_descs, tol)
@@ -893,7 +920,7 @@ def score_event(event, pairs, tol, neighbours=()):
     scored["displaced"] = None if event.displaced is None else OrderedDict([
         ("id", event.displaced.id),
         ("pos", event.displaced.pos),
-        ("pos_offset", event.displaced.pos - event.pos),
+        ("pos_offset", pred_offset(event.displaced, event.pos)),
         ("allele_bp", event_size(event.displaced.alt_descs)),
         ("expected_at", event.pos),
     ])
@@ -905,7 +932,7 @@ def score_event(event, pairs, tol, neighbours=()):
         scored["match"] = OrderedDict([
             ("id", match.id),
             ("pos", match.pos),
-            ("pos_offset", match.pos - event.pos),
+            ("pos_offset", pred_offset(match, event.pos)),
             ("allele_bp", event_size(match.alt_descs)),
             ("length_error", length_error),
             ("allele_match", alleles_overlap(event.alt_descs, match.alt_descs, tol)
@@ -1618,7 +1645,7 @@ def nearest_event(record, scored):
     for event in scored:
         if event["chrom"] != record.chrom:
             continue
-        distance = abs(event["pos"] - record.pos)
+        distance = abs(pred_offset(record, event["pos"]))
         if best is None or distance < best[0]:
             best = (distance, event)
     if best is None:
@@ -1646,7 +1673,7 @@ def unmatched_payload(record, scored):
             ("chrom", record.displaced_for.chrom),
             ("pos", record.displaced_for.pos),
             ("id", record.displaced_for.id),
-            ("pos_offset", record.pos - record.displaced_for.pos),
+            ("pos_offset", pred_offset(record, record.displaced_for.pos)),
         ])),
     ])
 
