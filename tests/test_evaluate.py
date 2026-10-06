@@ -186,6 +186,29 @@ def test_one_prediction_cannot_cover_two_stacked_events():
     print("PASS test_one_prediction_cannot_cover_two_stacked_events")
 
 
+def test_a_tsd_in_ref_is_matched_along_its_span():
+    """Two insertions 5 bp apart, called the miniME way: POS at the start of the TSD copy REF holds, 4 bp left of
+    each simulated point of insertion. Each call stands for its whole TSD, so neither is paired across."""
+    samples = ["S0", "S1"]
+    t0, t1 = "CATTA", "TCAAT"
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"]), _ins(1005, ["0", "1"])], samples,
+                    [(996, "a", t0, [t0 + ELEMENT + t0], f"TSD={t0}", ["1", "0"]),
+                     (1001, "b", t1, [t1 + ELEMENT + t1], f"TSD={t1}", ["0", "1"])])
+        assert [l["match"]["id"] for l in ev.loci] == ["a", "b"], [l["match"] for l in ev.loci]
+        assert [l["match"]["pos_offset"] for l in ev.loci] == [0, 0], [l["match"] for l in ev.loci]
+    print("PASS test_a_tsd_in_ref_is_matched_along_its_span")
+
+
+def test_a_tsd_not_in_ref_leaves_the_call_at_pos():
+    """A TSD the REF allele does not start with says nothing about where the record's position is anchored."""
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, ["S0"], [_ins(1000, ["1"])], ["S0"],
+                    [(996, "a", ANCHOR, [ANCHOR + ELEMENT], "TSD=CATTA", ["1"])])
+        assert ev.loci[0]["match"]["pos_offset"] == -4, ev.loci[0]["match"]
+    print("PASS test_a_tsd_not_in_ref_leaves_the_call_at_pos")
+
+
 def test_allele_agreement_wins_over_proximity_when_pairing():
     """A nearer call of the wrong allele must not steal the event from the right one."""
     with tempfile.TemporaryDirectory() as d:
@@ -965,6 +988,23 @@ def test_carrier_info_on_a_reference_held_element_marks_its_absence():
     print("PASS test_carrier_info_on_a_reference_held_element_marks_its_absence")
 
 
+def test_carrier_info_counts_an_excision_solo_ltr_as_the_event():
+    """An excision: the reference holds the element, and the ALT keeps a solo LTR that ME_INFO marks. That remnant
+    allele carries the event; an ALT holding the whole element with a SNP does not."""
+    samples = ["S0", "S1", "S2"]
+    ltr = ELEMENT[:300]
+    excision = (1000, "EXC-chrT-1000-6929-300-LTR/Copia-TY1-FULL", ANCHOR + ELEMENT, [ANCHOR + ltr],
+                "TYPE=EXC;EVENTTYPE=EXC", ["1", "0", "0"])
+    snp = ELEMENT[:-1] + ("A" if ELEMENT[-1] != "A" else "C")
+    me_info = (f"ME_INFO=chrT/1/{1 + len(ELEMENT)}/TY1,chrT_0/1/301/TY1,chrT_2/1/{1 + len(ELEMENT)}/TY1")
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [excision], samples,
+                    [(1000, "1.1", ANCHOR + ELEMENT, [ANCHOR + ltr, ANCHOR + snp], me_info, ["1", "0", "2"])],
+                    carrier_info="ME_INFO")
+        assert ev.loci[0]["carriers"]["predicted"] == ["S0"], ev.loci[0]["carriers"]
+    print("PASS test_carrier_info_counts_an_excision_solo_ltr_as_the_event")
+
+
 
 # ---- sequence check (--reference) ---------------------------------------------
 #
@@ -1074,6 +1114,8 @@ if __name__ == "__main__":
     test_a_short_allele_reads_negative_and_a_long_one_positive()
     test_a_prediction_beyond_max_dist_is_not_a_detection()
     test_one_prediction_cannot_cover_two_stacked_events()
+    test_a_tsd_in_ref_is_matched_along_its_span()
+    test_a_tsd_not_in_ref_leaves_the_call_at_pos()
     test_allele_agreement_wins_over_proximity_when_pairing()
     test_a_matched_call_of_the_wrong_allele_is_detected_but_not_concordant()
     test_a_stacked_call_is_not_the_same_allele_as_a_single_element()
@@ -1128,6 +1170,7 @@ if __name__ == "__main__":
     test_carrier_info_marks_which_alts_are_carrier_alleles()
     test_carrier_info_on_a_single_alt_record_is_presence()
     test_carrier_info_on_a_reference_held_element_marks_its_absence()
+    test_carrier_info_counts_an_excision_solo_ltr_as_the_event()
     test_a_call_anchored_before_the_tsd_is_haplotype_identical()
     test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence()
     test_one_wrong_base_inside_the_element_is_not_identical()
