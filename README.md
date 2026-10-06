@@ -232,7 +232,7 @@ Simulate pTE insertions/deletions and generate VCF and modified genome FASTA.
   at this pairwise diversity per bp (default: 0, none). See below
 - `bg-sv-rate` : Background structural variants -- deletions and tandem duplications -- per genome per Mb
   against the reference, on the same genealogies (default: 0, none). See below
-- `bg-sv-dup-frac / --bg-sv-min / --bg-sv-max` : Fraction that are duplications (0.5), and the log-uniform
+- `bg-sv-dup-frac / --bg-sv-min / --bg-sv-max` : Fraction that are duplications (0: deletions only), and the log-uniform
   length range (50-10,000 bp)
 - `bg-indel-frac / --bg-indel-max / --bg-margin / --bg-block` : Fraction of background variants
   that are indels (0.1), their longest length (50), how far they stay from any TE event (30 bp),
@@ -252,7 +252,7 @@ to the TE truth `<outprefix>.vcf`; TErandom `--nSV`'s synthetic insertions and d
 written there too. It draws from a random stream of its own: with or without it, the TE truth is
 the same.
 
-**Background SVs.** `--bg-sv-rate` adds deletions and tandem duplications that no TE made, at that
+**Background SVs.** `--bg-sv-rate` adds deletions (and, with `--bg-sv-dup-frac`, tandem duplications) that no TE made, at that
 many per genome per Mb against the reference, on the same per-block genealogies as the background SNPs,
 so genomes share them by descent. Lengths are log-uniform from `--bg-sv-min` to `--bg-sv-max`; they land
 anywhere, over the reference's own elements as readily as elsewhere, but never within `--bg-margin` of a

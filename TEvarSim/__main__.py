@@ -318,12 +318,13 @@ def main():
     Simulate_parser.add_argument("--bg-block", type=int, default=50000,
                     help="Block length, in bp, given its own genealogy: a stand-in for recombination (default: 50000)")
     Simulate_parser.add_argument("--bg-sv-rate", type=float, default=0.0,
-                    help="Background structural variants: deletions and tandem duplications per genome per Mb, counted "
+                    help="Background structural variants: deletions (and, with --bg-sv-dup-frac, tandem duplications) per genome per Mb, counted "
                          "against the reference, on the same genealogies as --bg-pi's variants, so shared by descent. "
                          "Placed anywhere but within --bg-margin of a TE event; written to <outprefix>.background_sv.vcf "
                          "and kept out of the TE truth. 0 (default) adds none")
-    Simulate_parser.add_argument("--bg-sv-dup-frac", type=ratio, default=0.5,
-                    help="Fraction of background SVs that are tandem duplications; the rest are deletions (default: 0.5)")
+    Simulate_parser.add_argument("--bg-sv-dup-frac", type=ratio, default=0.0,
+                    help="Fraction of background SVs that are tandem duplications; the rest are deletions (default: 0, "
+                         "deletions only)")
     Simulate_parser.add_argument("--bg-sv-min", type=int, default=50,
                     help="Shortest background SV, in bp; lengths are log-uniform (default: 50)")
     Simulate_parser.add_argument("--bg-sv-max", type=int, default=10000,

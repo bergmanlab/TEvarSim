@@ -103,7 +103,7 @@ class Simulator:
         self.bg_block = getattr(args, "bg_block", 50000)
         # Background structural variants (see _add_background): deletions and tandem duplications.
         self.bg_sv_rate = getattr(args, "bg_sv_rate", 0.0) or 0.0
-        self.bg_sv_dup_frac = getattr(args, "bg_sv_dup_frac", 0.5)
+        self.bg_sv_dup_frac = getattr(args, "bg_sv_dup_frac", 0.0)
         self.bg_sv_min = getattr(args, "bg_sv_min", 50)
         self.bg_sv_max = getattr(args, "bg_sv_max", 10000)
 

@@ -35,7 +35,7 @@ def test_background_svs():
         sim = os.path.join(d, "sim")
         _tevarsim("Simulate", "--ref", ref, "--bed", pool + ".bed", "--pool", pool + ".fa", "--num", N_GENOMES,
                   "--af-dist", "uniform", "--af-min", 0.3, "--af-max", 0.3, "--tsd-from-header",
-                  "--bg-pi", 0.002, "--bg-sv-rate", RATE, "-O", sim, "-D", 5)
+                  "--bg-pi", 0.002, "--bg-sv-rate", RATE, "--bg-sv-dup-frac", 0.5, "-O", sim, "-D", 5)
         truth, bg, sv = _vcf(sim + ".vcf"), _vcf(sim + ".background.vcf"), _vcf(sim + ".background_sv.vcf")
         assert sv and not any(r[2].startswith("bgSV") for r in truth + bg)
         types = {r[7].split(";")[0] for r in sv}
