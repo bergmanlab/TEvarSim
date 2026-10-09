@@ -38,6 +38,7 @@ from collections import OrderedDict
 import pysam
 
 from .compare_vcf import (
+    Allele,
     calculate_metrics,
     convert_to_ploidy,
     genotype_agrees,
@@ -613,7 +614,7 @@ def carries_event(event, neighbours, tsample, p_descs):
             any(t.symbolic or t.size is None for t in event.alt_descs) or not event.alt_descs:
         return True                 # nothing comparable by length: every non-reference allele counts, as before
     for size in sizes:
-        sized = [t.size for t in event.alt_descs
+        sized = [t.size for t in comparable_descs(event)
                  if t.size and (size > 0) == (t.size > 0)
                  and abs(size - t.size) <= EVENT_ALT_LENGTH_FRACTION * abs(t.size)]
         if not sized:
@@ -704,6 +705,72 @@ def haplotype_identical(event, match, pairs, fasta):
     return any(hap(event, t.seq) == hap(match, p.seq) for t in t_alts for p in p_alts)
 
 
+# How far a simulated insertion may sit from an end of a simulated deletion and still be read as inserted at the junction
+# the deletion leaves: the insertion's TSD and the breakpoint jitter of either event.
+JUNCTION_TOL = 50
+
+
+def _carrier_genomes(event):
+    return {s for s, gt in event.gts.items() if is_carrier(gt, {0})}
+
+
+def link_junction_events(events, tol=JUNCTION_TOL):
+    '''
+    Mark each simulated insertion that sits at the junction a simulated deletion leaves, in genomes that all carry
+    that deletion.
+
+    In those genomes the deletion's two ends are one point, so the insertion is as much at the deletion's start as at
+    its end, and a caller can write the pair as one site anchored at the deletion's start: the deleted sequence
+    replaced by the inserted element, the ALT holding the net change. The simulation writes the insertion at the end
+    the deletion reached instead, a deletion's length away, so such a call scored as a missed insertion plus an
+    unmatched prediction, and the insertion's carriers as false negatives of the deletion (fly sim, pe41 fly_bgall2:
+    a Stalker4 at the end of a deleted gypsy4, a Transpac at the end of a deleted gypsy6).
+
+    So the insertion gets the deletion's other end as a second anchor, and both events take the replacement's net
+    length as one more allele a call may agree with, and, for the genomes carrying both, one more genotype. A call
+    written the simulation's way still matches exactly as before.
+    '''
+    dels = [e for e in events if e.type == "DEL" and e.size]
+    for ins in events:
+        if ins.type != "INS" or not ins.size:
+            continue
+        carriers = _carrier_genomes(ins)
+        if not carriers:
+            continue
+        for d in dels:
+            if d.chrom != ins.chrom:
+                continue
+            start, end = d.pos, d.pos - d.size          # a deletion's size is negative
+            if abs(ins.pos - end) <= tol:
+                other = start
+            elif abs(ins.pos - start) <= tol:
+                other = end
+            else:
+                continue
+            if not carriers <= _carrier_genomes(d):
+                continue
+            net = Allele(-1, ins.size + d.size, "", False)
+            ins.anchors = getattr(ins, "anchors", (ins.pos,)) + (other,)
+            for e in (ins, d):
+                e.junction_descs = getattr(e, "junction_descs", ()) + (net,)
+                gt_descs = e.__dict__.setdefault("junction_gt_descs", {})
+                for sample in carriers:
+                    descs = e.descs.get(sample)
+                    if descs is not None:
+                        gt_descs[sample] = tuple(net if a.idx != 0 else a for a in descs)
+
+
+def comparable_descs(event):
+    '''The event's alleles, with the net length of any junction replacement it is part of (link_junction_events).'''
+    return tuple(event.alt_descs) + tuple(getattr(event, "junction_descs", ()))
+
+
+def event_offset(record, event):
+    '''pred_offset from the nearer of the event's anchors: its POS, and for an insertion at a deletion's junction the
+    deletion's other end.'''
+    return min((pred_offset(record, a) for a in getattr(event, "anchors", (event.pos,))), key=abs)
+
+
 def match_events(events, records, max_dist, tol):
     '''
     Pair each simulated event with at most one prediction record, and vice versa.
@@ -720,10 +787,10 @@ def match_events(events, records, max_dist, tol):
     candidates = []
     for i, event in enumerate(events):
         for j, record in enumerate(by_chrom.get(event.chrom, [])):
-            distance = abs(pred_offset(record, event.pos))
+            distance = abs(event_offset(record, event))
             if distance > max_dist:
                 continue
-            agree = alleles_overlap(event.alt_descs, record.alt_descs, tol)
+            agree = alleles_overlap(comparable_descs(event), record.alt_descs, tol)
             candidates.append((not agree, distance, i, event.chrom, j))
     candidates.sort()
     taken_events, taken_records = set(), set()
@@ -863,6 +930,10 @@ def score_event(event, pairs, tol, neighbours=()):
             wt_gt, wt_descs, wp_gt, wp_descs = match_ploidy(
                 t_gt, event.descs.get(tsample), p_gt, match.descs.get(psample))
             same = genotype_agrees(wt_descs, wp_descs, tol)
+            junction = getattr(event, "junction_gt_descs", {}).get(tsample)
+            if same is False and junction is not None:
+                _, jt_descs, _, jp_descs = match_ploidy(t_gt, junction, p_gt, match.descs.get(psample))
+                same = genotype_agrees(jt_descs, jp_descs, tol)
             if same is None:
                 same = sorted(a for a in wt_gt if a is not None) == \
                        sorted(a for a in wp_gt if a is not None)
@@ -928,14 +999,14 @@ def score_event(event, pairs, tol, neighbours=()):
     if match is None:
         scored["match"] = None
     else:
-        length_error = best_length_error(event.alt_descs, match.alt_descs)
+        length_error = best_length_error(comparable_descs(event), match.alt_descs)
         scored["match"] = OrderedDict([
             ("id", match.id),
             ("pos", match.pos),
-            ("pos_offset", pred_offset(match, event.pos)),
+            ("pos_offset", event_offset(match, event)),
             ("allele_bp", event_size(match.alt_descs)),
             ("length_error", length_error),
-            ("allele_match", alleles_overlap(event.alt_descs, match.alt_descs, tol)
+            ("allele_match", alleles_overlap(comparable_descs(event), match.alt_descs, tol)
                              if match.alt_descs else None),
         ])
     scored["carriers"] = OrderedDict([
@@ -1432,6 +1503,7 @@ class Evaluator:
             convert_to_ploidy(self.truth_file, self.nHap, truth_file)
         events, truth_samples, truth_rows = load_truth_events(
             truth_file, self.INSonly, self.TEtype)
+        link_junction_events(events)
 
         if self.predType == "VCF":
             records, pred_samples, pred_rows = load_pred_vcf(self.pred_file, self.carrier_info)

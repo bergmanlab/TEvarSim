@@ -1107,6 +1107,69 @@ def test_without_a_reference_nothing_changes():
         assert not os.path.exists(os.path.join(d, "out.exact.json"))
     print("PASS test_without_a_reference_nothing_changes")
 
+# ---- an insertion at a deletion's junction ------------------------------------
+INSERTED = "CAT" * 1000                      # 3000 bp, a different element
+DEL_POS = 1000
+DEL_END = DEL_POS + len(ELEMENT)             # the deletion's last REF base
+
+
+def _junction_truth():
+    """A reference element deleted in S0-S2, and another inserted at the deletion's end in S2 alone."""
+    return [(DEL_POS, "DEL-chrT-1000-6929-LTR/Copia-TY1", ANCHOR + ELEMENT, [ANCHOR], "TYPE=DEL;EVENTTYPE=DEL",
+             ["1", "1", "1", "0"]),
+            (DEL_END + 2, "CAT1#LTR/Gypsy_", ANCHOR, [ANCHOR + INSERTED], "TYPE=INS;EVENTTYPE=INS",
+             ["0", "0", "1", "0"])]
+
+
+def test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found():
+    """A caller writes the pair as one site at the deletion's start, the inserted element replacing the deleted one,
+    one record per event: both events are detected, no call is left unmatched, and every carrier is credited."""
+    samples = ["S0", "S1", "S2", "S3"]
+    alts = [ANCHOR, ANCHOR + INSERTED]
+    gts = ["1", "1", "2", "0"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, _junction_truth(), samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, alts, ".", gts),
+                     (DEL_POS, "1.2", ANCHOR + ELEMENT, alts, ".", gts)])
+        overall = ev.summary["overall"]
+        assert overall["n_detected"] == 2, overall
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert overall["carriers"]["tp"] == 4 and overall["carriers"]["fn"] == 0 \
+            and overall["carriers"]["fp"] == 0, overall["carriers"]
+    print("PASS test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found")
+
+
+def test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before():
+    """The same pair written the simulation's way -- the deletion, and the insertion at its end -- still matches
+    each event to its own record."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, _junction_truth(), samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, [ANCHOR], ".", ["1", "1", "1", "0"]),
+                     (DEL_END + 2, "2.1", ANCHOR, [ANCHOR + INSERTED], ".", ["0", "0", "1", "0"])])
+        overall = ev.summary["overall"]
+        assert overall["n_detected"] == 2, overall
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert overall["carriers"]["tp"] == 4 and overall["carriers"]["fn"] == 0, overall["carriers"]
+        assert overall["genotypes"]["concordance"] == 1.0, overall["genotypes"]
+    print("PASS test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before")
+
+
+def test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved():
+    """Linked only where every carrier of the insertion carries the deletion: otherwise its two ends are not one
+    point in those genomes, and the replacement call does not find the insertion."""
+    samples = ["S0", "S1", "S2", "S3"]
+    truth = _junction_truth()
+    truth[1] = truth[1][:5] + (["0", "0", "1", "1"],)        # S3 has the insertion but not the deletion
+    alts = [ANCHOR, ANCHOR + INSERTED]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, truth, samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, alts, ".", ["1", "1", "2", "0"]),
+                     (DEL_POS, "1.2", ANCHOR + ELEMENT, alts, ".", ["1", "1", "2", "0"])])
+        assert ev.summary["overall"]["n_detected"] == 1, ev.summary["overall"]
+    print("PASS test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1176,3 +1239,6 @@ if __name__ == "__main__":
     test_one_wrong_base_inside_the_element_is_not_identical()
     test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case()
     test_without_a_reference_nothing_changes()
+    test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found()
+    test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before()
+    test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved()
