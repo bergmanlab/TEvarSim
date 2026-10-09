@@ -1170,6 +1170,49 @@ def test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved():
     print("PASS test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved")
 
 
+# ---- one variant left as two records -----------------------------------------
+
+
+def test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited():
+    """Two identical records at one site, carriers divided between them: both count toward the event, neither is an
+    unmatched prediction, and the summary counts the second as a split duplicate."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "0", "1", "0"])])
+        overall = ev.summary["overall"]
+        assert overall["carriers"]["tp"] == 3 and overall["carriers"]["fn"] == 0 \
+            and overall["carriers"]["fp"] == 0, overall["carriers"]
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert ev.summary["predictions"]["split_duplicates"] == 1, ev.summary["predictions"]
+    print("PASS test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited")
+
+
+def test_a_second_record_sharing_a_carrier_stays_unmatched():
+    """A record claiming a genome the matched record already carries is a competing call, not a split."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1", "1", "0"])])
+        assert ev.summary["predictions"]["unmatched"] == 1, ev.summary["predictions"]
+        assert ev.summary["predictions"]["split_duplicates"] == 0, ev.summary["predictions"]
+    print("PASS test_a_second_record_sharing_a_carrier_stays_unmatched")
+
+
+def test_a_second_record_of_a_different_allele_stays_unmatched():
+    """Another allele at the site is another call, whatever its carriers."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + SOLO_LTR], ".", ["0", "0", "1", "0"])])
+        assert ev.summary["predictions"]["unmatched"] == 1, ev.summary["predictions"]
+        assert ev.summary["overall"]["carriers"]["fn"] == 1, ev.summary["overall"]["carriers"]
+    print("PASS test_a_second_record_of_a_different_allele_stays_unmatched")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1242,3 +1285,6 @@ if __name__ == "__main__":
     test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found()
     test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before()
     test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved()
+    test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited()
+    test_a_second_record_sharing_a_carrier_stays_unmatched()
+    test_a_second_record_of_a_different_allele_stays_unmatched()

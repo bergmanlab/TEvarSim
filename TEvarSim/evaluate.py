@@ -805,6 +805,49 @@ def match_events(events, records, max_dist, tol):
         # from a prediction back to the locus that claimed it as well as the other way.
         by_chrom[chrom][j].matched_for = events[i]
     match_displaced(events, by_chrom, taken_events, taken_records, max_dist, tol)
+    attach_split_duplicates(events, by_chrom, taken_records, max_dist, tol)
+
+
+def _pred_carriers(record):
+    return {s for s, gt in record.gts.items() if pred_is_carrier(record, gt)}
+
+
+def attach_split_duplicates(events, by_chrom, taken_records, max_dist, tol):
+    '''
+    Credit a matched event with a second record of the same allele that splits its carriers.
+
+    A caller that merges per-genome calls can leave one variant as two records: same site, same allele, the carrier
+    genomes divided between them (GraffiTE, after SURVIVOR's merge: fly sim bgall2 chr2R:8937805, two identical Tabor
+    records carried by 3 and 4 of the 7 genomes). The one-to-one matching pairs one record with the event, so the other
+    scored as an unmatched prediction, and its genomes twice over: as the event's false negatives and as false positives
+    of an unmatched call. The output is redundant, not wrong, so such a record is attached to the event instead:
+    within ``max_dist`` of it, an allele that agrees with the event's and with the matched record's, and carriers
+    disjoint from the matched record's and from any record already attached. Its genomes then count toward the event
+    as the matched record's would, and it is no longer an unmatched prediction; the summary counts these records apart.
+    A record sharing a carrier with the match is a competing claim, not a split, and stays unmatched.
+    '''
+    for event in events:
+        match = event.match
+        if match is None:
+            continue
+        claimed = _pred_carriers(match)
+        for j, record in enumerate(by_chrom.get(event.chrom, [])):
+            if record.matched or record.displaced_for is not None or (event.chrom, j) in taken_records:
+                continue
+            if abs(event_offset(record, event)) > max_dist:
+                continue
+            if not (alleles_overlap(comparable_descs(event), record.alt_descs, tol)
+                    and alleles_overlap(match.alt_descs, record.alt_descs, tol)):
+                continue
+            carriers = _pred_carriers(record)
+            if not carriers or carriers & claimed:
+                continue
+            claimed |= carriers
+            taken_records.add((event.chrom, j))
+            record.matched = True
+            record.matched_for = event
+            record.duplicate_of = match
+            event.split_duplicates = getattr(event, "split_duplicates", []) + [record]
 
 
 def ltr_shift(event):
@@ -906,8 +949,6 @@ def score_event(event, pairs, tol, neighbours=()):
     tp = fp = fn = 0
     compared = concordant = 0
     by_class = OrderedDict((cls, _blank_counts()) for cls in ALLELE_CLASSES)
-    multi = match is not None and \
-        len([a for a in (match.alts or ()) if a != "<*>"]) > 1
     untyped = []
     for tsample, psample in pairs:
         t_gt = event.gts.get(tsample, (None,))
@@ -918,21 +959,25 @@ def score_event(event, pairs, tol, neighbours=()):
             p_carrier = False
             typed = False
         else:
-            p_gt = match.gts.get(psample, (None,))
-            p_carrier = pred_is_carrier(match, p_gt)
-            if p_carrier and multi and match.carrier_alts is None and not carries_event(event, neighbours, tsample,
-                                                         match.descs.get(psample)):
+            # A genome carried by a split duplicate (attach_split_duplicates) is read from that record.
+            record = next((r for r in getattr(event, "split_duplicates", ())
+                           if pred_is_carrier(r, r.gts.get(psample, (None,)))), match)
+            p_gt = record.gts.get(psample, (None,))
+            p_carrier = pred_is_carrier(record, p_gt)
+            record_multi = len([a for a in (record.alts or ()) if a != "<*>"]) > 1
+            if p_carrier and record_multi and record.carrier_alts is None and not carries_event(
+                    event, neighbours, tsample, record.descs.get(psample)):
                 p_carrier = False
             typed = any(a is not None for a in p_gt)
             if p_carrier:
                 pred_carriers.append(psample)
             # A genotype is only comparable where a prediction record describes the locus.
             wt_gt, wt_descs, wp_gt, wp_descs = match_ploidy(
-                t_gt, event.descs.get(tsample), p_gt, match.descs.get(psample))
+                t_gt, event.descs.get(tsample), p_gt, record.descs.get(psample))
             same = genotype_agrees(wt_descs, wp_descs, tol)
             junction = getattr(event, "junction_gt_descs", {}).get(tsample)
             if same is False and junction is not None:
-                _, jt_descs, _, jp_descs = match_ploidy(t_gt, junction, p_gt, match.descs.get(psample))
+                _, jt_descs, _, jp_descs = match_ploidy(t_gt, junction, p_gt, record.descs.get(psample))
                 same = genotype_agrees(jt_descs, jp_descs, tol)
             if same is None:
                 same = sorted(a for a in wt_gt if a is not None) == \
@@ -1008,6 +1053,7 @@ def score_event(event, pairs, tol, neighbours=()):
             ("length_error", length_error),
             ("allele_match", alleles_overlap(comparable_descs(event), match.alt_descs, tol)
                              if match.alt_descs else None),
+            ("split_duplicates", [r.id for r in getattr(event, "split_duplicates", ())]),
         ])
     scored["carriers"] = OrderedDict([
         ("truth", truth_carriers),
@@ -1451,6 +1497,8 @@ class Evaluator:
             ("matched", matched),
             ("unmatched", unmatched),
             ("displaced", n_displaced_calls),
+            # Matched records that are a second record of an event's allele (attach_split_duplicates).
+            ("split_duplicates", sum(1 for r in records if getattr(r, "duplicate_of", None) is not None)),
             ("precision", round(matched / len(records), 4) if records else None),
         ])
         # Counted per event class, not per record: an element inserted and later excised is
