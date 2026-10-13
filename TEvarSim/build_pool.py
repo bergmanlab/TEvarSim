@@ -5,8 +5,8 @@ import os
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-from .utils import (sample_TEins, bgSV, make_min_TE, pick_stranded,
-                    description_tail, parse_tsd_tag)
+from .utils import (sample_TEins, bgSV, make_min_TE, take_stranded, layer_rng,
+                    LAYER_INS, LAYER_DEL, LAYER_EXC, description_tail, parse_tsd_tag)
 
 def is_dna(seq: Seq) -> bool:
     return set(str(seq)) <= set("ATGCN")
@@ -276,41 +276,62 @@ class RandomTE:
             np.random.seed(self.random_seed)
             random.seed(self.random_seed)
 
+        # Events are made in layers -- insertions, then deletions, then excisions, then
+        # non-mobilizing SVs -- each from a stream of its own, and each layer keeps clear of the
+        # ones before it and never the reverse. So a series of runs that share a seed and differ
+        # in one layer share every layer before it: the same insertions, at the same positions,
+        # from the same families, with or without deletions; the same deletions with or without
+        # excisions. Deletions and excisions are taken in a fixed shuffled order, so asking for
+        # more of them adds to the set and keeps the ones a smaller count took.
+        self.ins_rng = layer_rng(self.random_seed, LAYER_INS)
+        self.del_rng = layer_rng(self.random_seed, LAYER_DEL)
+        self.exc_rng = layer_rng(self.random_seed, LAYER_EXC)
+
         # Strand targeting applies to placed insertions and selected deletions; excisions inherit
         # the orientation of the reference element, so they are not part of the strand budget.
-        n_strand = self.nDEL + self.nINS
-        if args.sense_strand_ratio is not None:
-            n_sense = round(n_strand*args.sense_strand_ratio)
-            self.target_strands = (["+"] * n_sense) + (["-"] * (n_strand - n_sense))
-            np.random.shuffle(self.target_strands)
-        else:
-            self.target_strands = [None] * n_strand
+        # One target list per layer, so the deletion count cannot move an insertion's strand, each
+        # shuffled by a stream apart from its layer's, so its length cannot move the layer's draws.
+        def strands(n, layer):
+            if args.sense_strand_ratio is None:
+                return [None] * n
+            n_sense = round(n * args.sense_strand_ratio)
+            return list(layer_rng(self.random_seed, layer, 1).permutation(["+"] * n_sense + ["-"] * (n - n_sense)))
+        self.ins_strands = strands(self.nINS, LAYER_INS)
+        self.del_strands = strands(self.nDEL, LAYER_DEL)
 
     def _run(self):
-        # 1. parse DEL file (populates self.DEL, and self.EXC candidates for RepeatMasker input)
-        self.parse_DEL()
-        # 2. select excisions (full-length LTR elements) first, then drop those loci from the
-        #    deletion candidate pool so a locus is never used as both a DEL and an EXC.
-        self.select_EXC()
-        # 3. select deletions from the remaining candidates
-        if self.nDEL > len(self.DEL):
-            raise ValueError(
-                f"Requested {self.nDEL} deletions but only {len(self.DEL)} available in --existingTEs "
-                f"after filtering (and after removing excision loci). Lower --nDEL, or relax --TEtype/--DELlen."
-            )
         logging.info(f"Generating {self.nINS} INS, {self.nDEL} DEL and {self.nEXC} EXC for chromosome(s) {','.join(self.CHR.keys())}")
         nplaced = self.nDEL + self.nINS
         if self.nMIN > 0 and self.nMIN >= nplaced:
             raise ValueError(f"minimum number of a TE family ({self.nMIN}) should be less than nDEL+nINS ({nplaced})")
-        nm_hosts = list(self.DEL)    # every candidate left once the excisions are out; see select_NM
-        if self.nMIN > 0:
-            self.DEL = make_min_TE(self.DEL, self.nMIN, self.nDEL, self.TEtype, self.target_strands[:self.nDEL])
-        else:
-            self.DEL = pick_stranded(self.DEL, self.nDEL, self.target_strands[:self.nDEL])
-        # 4. non-mobilizing SVs, on elements neither deleted nor excised
-        self.select_NM(nm_hosts)
-        # 5. place insertions (avoiding the selected DEL, EXC and NM spans)
+        # 1. place insertions, before anything else and knowing nothing of it
         self.parse_TEpool()
+        # 2. parse DEL file (populates self.DEL, and self.EXC candidates for RepeatMasker input),
+        #    and drop every candidate an insertion landed in or beside
+        self.parse_DEL()
+        self.DEL = self.clear_of(self.DEL, self.INS)
+        self.EXC = self.clear_of(self.EXC, self.INS)
+        nm_hosts = list(self.DEL)    # select_NM passes over those a deletion or excision took
+        # 3. select deletions
+        if self.nDEL > len(self.DEL):
+            raise ValueError(
+                f"Requested {self.nDEL} deletions but only {len(self.DEL)} available in --existingTEs "
+                f"after filtering (and after removing those an insertion landed in). Lower --nDEL, or relax --TEtype/--DELlen."
+            )
+        if self.nMIN > 0:
+            # Draws from the global stream, so a deletion set built with --nMIN is not nested
+            # across deletion counts the way take_stranded's is.
+            random.seed(None if self.random_seed is None else self.random_seed + LAYER_DEL)
+            self.DEL = make_min_TE(self.DEL, self.nMIN, self.nDEL, self.TEtype, self.del_strands)
+        else:
+            self.DEL = take_stranded(self.del_rng.permutation(len(self.DEL)), self.DEL,
+                                     self.nDEL, self.del_strands)
+        # 4. select excisions from the full-length LTR elements no deletion took. A deletion
+        #    candidate overlapping an excision candidate is the same element (with
+        #    --excCandidates the deletion's span carries the TSD copy the excision's does not).
+        self.select_EXC()
+        # 5. non-mobilizing SVs, on elements neither deleted nor excised
+        self.select_NM(nm_hosts)
         # 6. Generate BED file
         self.build_bed()
         logging.info(f"Generated TE BED file: {self.prefix}.bed")
@@ -322,26 +343,38 @@ class RandomTE:
             bgSV(bedin, bedout, self.nSV, bg_ins_ratio, self.pool_fasta, self.out_fasta)
             logging.info(f"Generated BED file and fasta file with background SVs are: {bedout} and {self.out_fasta}")
 
+    def clear_of(self, candidates, insertions):
+        """The candidates no insertion lies in or within --TEdistance of: the buffer insertions
+        keep from each other, and the one they kept from deletions when they were placed last."""
+        points = {}
+        for chrom, pos, *_ in insertions:
+            points.setdefault(chrom, []).append(pos)
+        d = self.TEdistance
+        return [c for c in candidates
+                if not any(c[1] - d <= p < c[2] + d for p in points.get(c[0], ()))]
+
     def select_EXC(self):
-        """Pick nEXC full-length LTR elements to excise, and remove their loci from self.DEL."""
+        """Pick nEXC full-length LTR elements to excise from those no deletion took."""
         if not hasattr(self, "EXC"):
             self.EXC = []
         if self.nEXC == 0:
             self.EXC = []
             return
-        if self.nEXC > len(self.EXC):
+        # Every candidate stays in the shuffle, the ones a deletion took among them, and is passed
+        # over when its turn comes: the order of the rest is then the same whatever was deleted.
+        order = self.exc_rng.permutation(len(self.EXC))
+        deleted = {}
+        for d in self.DEL:
+            deleted.setdefault(d[0], []).append((d[1], d[2]))
+        free = [i for i in order
+                if not any(self.EXC[i][1] < e and s < self.EXC[i][2] for s, e in deleted.get(self.EXC[i][0], []))]
+        if self.nEXC > len(free):
             raise ValueError(
-                f"Requested {self.nEXC} excisions but only {len(self.EXC)} full-length LTR elements "
-                f"available in --existingTEs after filtering. Lower --nEXC, or relax --TEtype/--DELlen."
+                f"Requested {self.nEXC} excisions but only {len(free)} full-length LTR elements "
+                f"available in --existingTEs after filtering (and after removing those an insertion "
+                f"landed in or a deletion took). Lower --nEXC, or relax --TEtype/--DELlen."
             )
-        chosen = random.sample(self.EXC, self.nEXC)
-        # A deletion candidate that overlaps a chosen element is that element (with --excCandidates the
-        # deletion's span carries the TSD copy the excision's does not), so it cannot be deleted as well.
-        by_chrom = {}
-        for c in chosen:
-            by_chrom.setdefault(c[0], []).append((c[1], c[2]))
-        self.DEL = [d for d in self.DEL if not any(d[1] < e and s < d[2] for s, e in by_chrom.get(d[0], []))]
-        self.EXC = chosen
+        self.EXC = [self.EXC[i] for i in free[:self.nEXC]]
 
     def select_NM(self, hosts):
         """Choose nNM non-mobilizing SVs: deletions that take part or all of a reference element and
@@ -367,7 +400,8 @@ class RandomTE:
         if self.nNM == 0:
             return
         rnd = random.Random(None if self.random_seed is None else self.random_seed + 4241)
-        taken = sorted((d[0], d[1], d[2]) for d in self.DEL + self.EXC)
+        taken = sorted([(d[0], d[1], d[2]) for d in self.DEL + self.EXC] +
+                       [(i[0], i[1] - self.TEdistance, i[1] + self.TEdistance) for i in self.INS])
         taken_by_chrom = {}
         for c, s, e in taken:
             taken_by_chrom.setdefault(c, []).append((s, e))
@@ -609,11 +643,9 @@ class RandomTE:
         if self.nINS == 0:
             return
         records = list(SeqIO.parse(self.pool_fasta, "fasta"))
-        # Guard against lst[-0:] == lst[0:] (whole list); explicitly take the last nINS entries.
-        ins_strands = self.target_strands[-self.nINS:]
-        # Insertions must avoid both selected deletion and excision spans.
-        exclusion = self.DEL + self.EXC + self.NM
-        INSpos = sample_TEins(self.regions, exclusion, self.nINS, TEdistance=self.TEdistance, target_strands=ins_strands)
+        # The first layer: the deletions, excisions and non-mobilizing SVs keep clear of these.
+        INSpos = sample_TEins(self.regions, [], self.nINS, TEdistance=self.TEdistance,
+                              target_strands=self.ins_strands, rng=self.ins_rng)
         for record, (chrom, pos, strand) in zip(records,INSpos):
             self.INS.append((chrom, pos, pos, record.id, record.id.split("/")[1], "INS", strand))
 

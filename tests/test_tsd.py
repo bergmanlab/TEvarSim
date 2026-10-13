@@ -187,12 +187,13 @@ def test_parse_tsd_tag_grammar():
         raise AssertionError(f"{tail!r} should not have parsed")
 
 
-def test_header_value_overrides_the_flags():
-    """A tagged element takes its own length, not the one --tsd-min/--tsd-max would give."""
+def test_header_value_stands_when_no_bound_is_given():
+    """A tagged element takes its own length. The 5-20 default range is only the fallback for
+    an untagged one: it does not clamp copia's TSD=4 up to 5."""
     pos = INS_POS
     with tempfile.TemporaryDirectory() as d:
         records, genome = _run(d, [_ins(pos, "copia#LTR/Copia")], [COPIA],
-                               tsd_min=9, tsd_max=9, tsd_from_header=True)
+                               tsd_min=None, tsd_max=None, tsd_from_header=True)
         assert _info(records[0])["TSD"] == "4", _info(records[0])
         assert records[0][4] == CHR_T[pos - 1] + ELEMENT + CHR_T[pos - 4:pos]
         assert genome == CHR_T[:pos] + ELEMENT + CHR_T[pos - 4:pos] + CHR_T[pos:]
@@ -202,10 +203,10 @@ def test_header_range_is_drawn_within_its_bounds():
     """A range means a spread, and every drawn length must land inside it."""
     rows = [_ins(30 + i * 25, "jockey#LINE/Jockey") for i in range(6)]
     with tempfile.TemporaryDirectory() as d:
-        records, _ = _run(d, rows, [JOCKEY], tsd_min=0, tsd_max=0, tsd_from_header=True)
+        records, _ = _run(d, rows, [JOCKEY], tsd_min=None, tsd_max=None, tsd_from_header=True)
         lengths = {int(_info(r)["TSD"]) for r in records}
         assert lengths and all(5 <= n <= 15 for n in lengths), lengths
-        assert lengths != {0}, "the global flags leaked past the tag"
+        assert len(lengths) > 1, "a range drew one length six times"
 
 
 def test_header_zero_means_no_duplication():
@@ -213,7 +214,7 @@ def test_header_zero_means_no_duplication():
     pos = INS_POS
     with tempfile.TemporaryDirectory() as d:
         records, genome = _run(d, [_ins(pos, "helitron#RC/Helitron")], [HELITRON],
-                               tsd_min=8, tsd_max=8, tsd_from_header=True)
+                               tsd_min=None, tsd_max=None, tsd_from_header=True)
         assert _info(records[0])["TSD"] == "0"
         assert records[0][4] == CHR_T[pos - 1] + ELEMENT
         assert genome == CHR_T[:pos] + ELEMENT + CHR_T[pos:]
@@ -226,23 +227,20 @@ def test_untagged_element_falls_back_and_warns_once():
         err = io.StringIO()
         with redirect_stderr(err):
             records, _ = _run(d, rows, [COPIA, BARE],
-                              tsd_min=7, tsd_max=7, tsd_from_header=True)
+                              tsd_min=None, tsd_max=7, tsd_from_header=True)
         warnings = [ln for ln in err.getvalue().splitlines() if "--tsd-from-header" in ln]
         assert len(warnings) == 1, err.getvalue()
         assert "bare#LTR/Gypsy" in warnings[0], warnings[0]
         assert "copia#LTR/Copia" not in warnings[0], warnings[0]
         by_id = {r[2]: int(_info(r)["TSD"]) for r in records}
         assert by_id["copia#LTR/Copia"] == 4, by_id
-        assert by_id["bare#LTR/Gypsy"] == 7, by_id
+        assert 5 <= by_id["bare#LTR/Gypsy"] <= 7, by_id
 
 
-def test_header_tsd_does_not_move_the_global_stream():
-    """Reading a tag must not shift the draws of events that do not use one.
-
-    The length is drawn and then overridden rather than skipped, so a deletion -- which has
-    no pool record and keeps the flag-driven length -- gets the same number either way. This
-    is the assertion that fails if someone later "optimises" that draw away.
-    """
+def test_header_tsd_does_not_move_other_events():
+    """Reading a tag must not shift the draws of events that do not use one: a deletion --
+    which has no pool record and keeps the flag-driven length -- gets the same number either
+    way, because every event draws from a stream of its own."""
     rows = [_ins(60, "copia#LTR/Copia"), ("chrT", 100, 130, "-", ".", "+")]
     with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
         with redirect_stderr(io.StringIO()):
@@ -268,6 +266,69 @@ def test_background_insertions_keep_zero_tsd_and_do_not_warn():
             background = [line.rstrip("\n").split("\t") for line in f if not line.startswith("#")]
         assert len(background) == 1 and background[0][4] == background[0][3] + ELEMENT, background
         assert "--tsd-from-header" not in err.getvalue(), err.getvalue()
+
+
+# ---------------------------------------------------------------- explicit bounds clamp the tag
+
+FIVE = (">five#DNA/hAT TSD=5", ELEMENT)
+
+
+def _tsd_of(d, record, **bounds):
+    with redirect_stderr(io.StringIO()):
+        records, genome = _run(d, [_ins(INS_POS, record[0][1:].split()[0])], [record],
+                               tsd_from_header=True, **bounds)
+    return int(_info(records[0])["TSD"]), records[0][4], genome
+
+
+def test_a_tag_inside_explicit_bounds_stands():
+    """TSD=5 under --tsd-min 2 --tsd-max 6 is 5."""
+    with tempfile.TemporaryDirectory() as d:
+        assert _tsd_of(d, FIVE, tsd_min=2, tsd_max=6)[0] == 5
+
+
+def test_a_tag_above_an_explicit_max_takes_the_max():
+    """TSD=5 under --tsd-max 4 is 4, and the genome carries four duplicated bases."""
+    with tempfile.TemporaryDirectory() as d:
+        n, alt, genome = _tsd_of(d, FIVE, tsd_min=2, tsd_max=4)
+        assert n == 4
+        assert alt == CHR_T[INS_POS - 1] + ELEMENT + CHR_T[INS_POS - 4:INS_POS], alt
+        assert genome == CHR_T[:INS_POS] + ELEMENT + CHR_T[INS_POS - 4:INS_POS] + CHR_T[INS_POS:]
+
+
+def test_tsd_max_zero_is_no_tsd():
+    """--tsd-max 0 alone (no --tsd-min) means no duplication, tagged or not."""
+    with tempfile.TemporaryDirectory() as d:
+        n, alt, genome = _tsd_of(d, FIVE, tsd_min=None, tsd_max=0)
+        assert n == 0 and alt == CHR_T[INS_POS - 1] + ELEMENT, alt
+        assert genome == CHR_T[:INS_POS] + ELEMENT + CHR_T[INS_POS:]
+    with tempfile.TemporaryDirectory() as d:
+        assert _tsd_of(d, BARE, tsd_min=None, tsd_max=0)[0] == 0
+
+
+def test_a_tag_below_an_explicit_min_takes_the_min():
+    """copia's TSD=4 under --tsd-min 8 is 8."""
+    with tempfile.TemporaryDirectory() as d:
+        assert _tsd_of(d, COPIA, tsd_min=8, tsd_max=None)[0] == 8
+
+
+def test_a_tag_range_is_cut_to_the_explicit_bounds():
+    """TSD=5-15 under --tsd-max 10 draws from 5-10."""
+    rows = [_ins(30 + i * 25, "jockey#LINE/Jockey") for i in range(6)]
+    with tempfile.TemporaryDirectory() as d:
+        records, _ = _run(d, rows, [JOCKEY], tsd_min=None, tsd_max=10, tsd_from_header=True)
+        lengths = {int(_info(r)["TSD"]) for r in records}
+        assert lengths and all(5 <= n <= 10 for n in lengths), lengths
+
+
+def test_changing_the_tsd_changes_nothing_else():
+    """The same insertions with and without TSDs: the same carriers, the same strands."""
+    rows = [_ins(30 + i * 25, "jockey#LINE/Jockey") for i in range(6)]
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        kw = dict(af_min=0.3, af_max=0.7, num=8, allow_zero_carriers=True, tsd_from_header=True)
+        on, _ = _run(d1, rows, [JOCKEY], tsd_min=None, tsd_max=None, **kw)
+        off, _ = _run(d2, rows, [JOCKEY], tsd_min=None, tsd_max=0, **kw)
+        assert [r[:2] + r[9:] for r in on] == [r[:2] + r[9:] for r in off]
+        assert {_info(r)["TSD"] for r in off} == {"0"}
 
 
 if __name__ == "__main__":

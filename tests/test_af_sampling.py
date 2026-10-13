@@ -15,11 +15,10 @@ the low frequencies that make insertions private that is most of them: asking fo
 population produced an almost empty one. Every event now gets a carrier unless
 --allow-zero-carriers says otherwise.
 
-The draw-count assertions matter more than they look. Every later draw in a run reads the
-same global stream, so a distribution that consumed a different number of values would shift
-all of them, and switching --af-dist would silently change the TSD of every event. That is
-why the exponential is sampled by inverse CDF rather than by rejection, and why the rescue
-draws from a stream of its own.
+Every event draws from streams of its own, seeded by the run's seed and the event, so its
+allele frequency, carriers and TSD are the same in every run of the seed that has it, whatever
+else the BED holds. The exponential is sampled by inverse CDF, one uniform per event, so that
+--af-dist reshapes the frequencies without reordering which events are rare.
 
 No external test runner is required::
 
@@ -99,41 +98,32 @@ def _run_genotypes(d, n, bed_rows=None, **overrides):
 
 # ---------------------------------------------------------------- the allele frequency draw
 
-def test_uniform_branch_is_bitwise_unchanged():
-    """The default must draw exactly what the bare np.random.uniform call drew before."""
+def _u(n, seed):
+    return np.random.default_rng(seed).random(n)
+
+
+def test_uniform_is_the_uniform_draw_rescaled():
+    """The default spreads each event's own uniform draw linearly over [af_min, af_max]."""
     sim = _sampler(af_dist="uniform", af_min=0.1, af_max=0.9)
-    np.random.seed(7)
-    got = sim._draw_afs(50)
-    np.random.seed(7)
-    want = np.random.uniform(0.1, 0.9, size=50)
-    assert np.array_equal(got, want), (got[:3], want[:3])
+    u = _u(50, 7)
+    assert np.allclose(sim._draw_afs(u), 0.1 + 0.8 * u)
 
 
-def test_both_distributions_leave_the_stream_in_the_same_place():
-    """One draw per event, whichever distribution -- proved without any statistics.
-
-    If the exponential consumed a different number of values, every draw after it would
-    shift, so --af-dist would silently change the TSD of every event in the run.
-    """
-    uni = _sampler(af_dist="uniform")
+def test_a_frequency_depends_on_its_own_draw_alone():
+    """--af-dist reshapes every frequency without reordering which events are the rare ones:
+    each is a monotone function of the same uniform, whichever distribution."""
+    uni = _sampler(af_dist="uniform", af_min=0.0, af_max=1.0)
     exp = _sampler(af_dist="exponential", af_mean=0.05, af_min=0.0, af_max=1.0)
-    np.random.seed(11)
-    uni._draw_afs(50)
-    after_uniform = np.random.random_sample()
-    np.random.seed(11)
-    exp._draw_afs(50)
-    after_exponential = np.random.random_sample()
-    assert after_uniform == after_exponential, (after_uniform, after_exponential)
+    u = _u(50, 11)
+    assert np.array_equal(np.argsort(uni._draw_afs(u)), np.argsort(exp._draw_afs(u)))
 
 
 def test_exponential_matches_the_closed_form():
     """Pins the parameterisation: lam is 1/af_mean, and the inversion is the truncated one."""
     a, b, mean = 0.0, 1.0, 0.05
     sim = _sampler(af_dist="exponential", af_mean=mean, af_min=a, af_max=b)
-    np.random.seed(3)
-    u = np.random.random_sample(200)
-    np.random.seed(3)
-    got = sim._draw_afs(200)
+    u = _u(200, 3)
+    got = sim._draw_afs(u)
     lam = 1.0 / mean
     want = np.clip(a - np.log1p(u * np.expm1(-lam * (b - a))) / lam, a, b)
     assert np.array_equal(got, want)
@@ -143,8 +133,7 @@ def test_exponential_mean_matches_the_analytic_truncated_mean():
     """The shape check. Fixed seed, so the tolerance is a margin and not a coin flip."""
     a, b, mean = 0.0, 1.0, 0.05
     sim = _sampler(af_dist="exponential", af_mean=mean, af_min=a, af_max=b)
-    np.random.seed(19)
-    afs = sim._draw_afs(20000)
+    afs = sim._draw_afs(_u(20000, 19))
     lam = 1.0 / mean
     analytic = a + 1.0 / lam - (b - a) / np.expm1(lam * (b - a))
     assert abs(afs.mean() - analytic) < 0.005, (afs.mean(), analytic)
@@ -156,31 +145,43 @@ def test_exponential_mean_matches_the_analytic_truncated_mean():
 def test_exponential_respects_the_truncation_bounds():
     """--af-min and --af-max bound the exponential, and nothing escapes into p > 1."""
     sim = _sampler(af_dist="exponential", af_mean=0.05, af_min=0.3, af_max=0.6)
-    np.random.seed(5)
-    afs = sim._draw_afs(5000)
+    afs = sim._draw_afs(_u(5000, 5))
     assert afs.min() >= 0.3 and afs.max() <= 0.6, (afs.min(), afs.max())
 
 
-def test_degenerate_bounds_return_the_value_and_still_consume_draws():
-    """af_min == af_max leaves one legal frequency, but the stream must not notice."""
+def test_degenerate_bounds_return_the_value():
+    """af_min == af_max leaves one legal frequency."""
     sim = _sampler(af_dist="exponential", af_mean=0.05, af_min=0.4, af_max=0.4)
-    np.random.seed(13)
-    afs = sim._draw_afs(20)
-    after = np.random.random_sample()
+    afs = sim._draw_afs(_u(20, 13))
     assert np.all(afs == 0.4), afs[:3]
-    np.random.seed(13)
-    np.random.uniform(0.4, 0.4, size=20)
-    assert after == np.random.random_sample()
 
 
 def test_no_events_draws_nothing():
-    """A contig with no events must not advance the stream on its behalf."""
+    """A contig with no events gets no frequencies."""
     sim = _sampler(af_dist="exponential", af_mean=0.05)
-    np.random.seed(23)
-    assert sim._draw_afs(0).size == 0
-    after = np.random.random_sample()
-    np.random.seed(23)
-    assert after == np.random.random_sample()
+    assert sim._draw_afs(np.empty(0)).size == 0
+
+
+def test_an_event_comes_out_the_same_whatever_else_is_in_the_bed():
+    """The point of drawing per event: a run that adds events to a BED -- deletions to a set
+    of insertions, say -- leaves the carriers of every event the two runs share as they were."""
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        kw = dict(num=8, af_dist="exponential", af_mean=0.2, af_min=0.0, af_max=1.0,
+                  allow_zero_carriers=True)
+        every = _events(40)
+        alone = _genotype_rows(_run_genotypes(d1, 0, bed_rows=every[::2], **kw))
+        mixed = _genotype_rows(_run_genotypes(d2, 0, bed_rows=every, **kw))
+        assert np.array_equal(alone, mixed[::2])
+        assert alone.any() and not alone.all(), "fixture exercises neither branch"
+
+
+def test_the_seed_still_decides():
+    """Per-event streams are the run's seed and the event, not the event alone."""
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        kw = dict(num=8, af_min=0.5, af_max=0.5, allow_zero_carriers=True)
+        one = _genotype_rows(_run_genotypes(d1, 40, seed=1, **kw))
+        two = _genotype_rows(_run_genotypes(d2, 40, seed=2, **kw))
+        assert not np.array_equal(one, two)
 
 
 # ---------------------------------------------------------------- the zero-carrier rescue
@@ -238,9 +239,8 @@ def test_allow_zero_carriers_restores_the_old_behaviour():
 def test_rescue_draws_from_its_own_stream():
     """Two runs differing only in the rescue must differ only in the rows it touched.
 
-    The rescue reads an auxiliary generator, not the global one, so the genotype rows of
-    every event it did not touch are unchanged. Without that, turning the rescue on would
-    shift every draw after the first rescued event.
+    The rescue reads a stream of the event's own, apart from its genotype draw, so the genotype
+    rows of every event it did not touch are unchanged.
     """
     with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
         kw = dict(num=8, af_dist="exponential", af_mean=0.01, af_min=0.0, af_max=1.0)
@@ -260,10 +260,9 @@ def test_reflected_exponential_mirrors_the_exponential():
     high mean just flattens it towards uniform instead of concentrating mass at the top.
     """
     sim = _sampler(af_dist="exponential", af_mean=0.02, af_min=0.0, af_max=1.0)
-    np.random.seed(31)
-    fwd = sim._draw_afs(20000)
-    np.random.seed(31)
-    rev = sim._draw_afs(20000, dist="reflected_exponential")
+    u = _u(20000, 31)
+    fwd = sim._draw_afs(u)
+    rev = sim._draw_afs(u, dist="reflected_exponential")
     assert np.allclose(rev, 0.0 + 1.0 - fwd)
     assert abs(fwd.mean() - 0.02) < 0.005, fwd.mean()
     assert abs(rev.mean() - 0.98) < 0.005, rev.mean()
@@ -282,11 +281,7 @@ def test_deletion_spec_inherits_part_by_part():
 
 
 def test_no_deletion_spec_leaves_the_draw_untouched():
-    """Byte-identity guard: without a --del-af-* option the single-draw path must be used.
-
-    Splitting the draw always would reorder the RNG for every mixed-type run, changing the
-    output of runs that never asked for this feature.
-    """
+    """Without a --del-af-* option nothing reports a separate deletion spectrum."""
     with tempfile.TemporaryDirectory() as d:
         sim = simulate.Simulator(_args(d, []))
         assert not sim._af_by_type
@@ -295,8 +290,7 @@ def test_no_deletion_spec_leaves_the_draw_untouched():
 def test_deletions_draw_high_and_insertions_low():
     """The point of the whole feature, end to end on a mixed BED."""
     # Laid out to fit inside the 2000bp test contig, alternating so the two types are
-    # interleaved in BED order -- which is the order the single-draw path would use, and so
-    # the arrangement most likely to expose a mix-up between the two groups.
+    # interleaved in BED order, the arrangement most likely to expose a mix-up between them.
     rows = []
     for i in range(12):
         p = 60 + i * 150

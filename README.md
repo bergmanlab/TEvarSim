@@ -164,6 +164,18 @@ their allele frequencies from the insertion spec (they are new mutations, so rar
 the calls a caller made at them. They draw from a random stream of their own, so the deletions,
 excisions and insertions are those a run without them would make.
 
+**Layers, for series of simulations.** TErandom makes its events in layers, in this order:
+insertions, deletions, excisions, non-mobilizing SVs. Each layer draws from a random stream of its
+own under `--seed` and keeps clear of every layer before it (an `--existingTEs` element an insertion
+landed in, or within `--TEdistance` of, is never deleted or excised), never the reverse. Deletions
+and excisions are taken in a fixed shuffled order, so asking for more of them adds to the set. Runs
+that share a seed and the insertion arguments therefore share their insertions -- positions,
+families, strands, sequences -- whatever deletions, excisions or non-mobilizing SVs they add, and
+runs that share the deletion arguments as well share their deletions. Simulate draws each event's
+allele frequency, carriers and TSD from streams seeded by `--seed` and the event itself, so a shared
+event also has the same carriers and TSD in every run. `--nMIN` deletions are the exception: they
+are not nested across deletion counts.
+
 ### 2. TEreal
 Automatically generate pTE positions from RepeatMasker or UCSC repeat annotations.
 
@@ -225,7 +237,7 @@ Simulate pTE insertions/deletions and generate VCF and modified genome FASTA.
   DELETIONS only; each part defaults to its `--af-*` counterpart
 - `allow-zero-carriers` : Keep events that no genome drew, instead of giving each one a carrier
 - `tsd-min / --tsd-max` : Min/max TSD length, used for every element that does not state its
-  own (default: 5/20)
+  own (default: 5/20). Given explicitly, they also clamp a stated `TSD=` (see below)
 - `tsd-from-header` : Take each insertion's TSD length from a `TSD=` tag on its pool FASTA header
 - `sense-strand-ratio` : Proportion of sense-strand insertions (default: 0.5)  
 - `bg-pi` : Background variation -- SNPs and short indels shared among the genomes by descent --
@@ -289,6 +301,12 @@ only place a typo can be caught.
 `--tsd-min`/`--tsd-max` and are named in a single warning. It applies to insertions only:
 deletions and excisions have no pool record and duplicate nothing, so their `INFO/TSD` remains
 a draw from the global range and remains meaningless.
+
+A `--tsd-min` or `--tsd-max` given explicitly clamps every tag: `TSD=5` stays 5 under
+`--tsd-min 2 --tsd-max 6`, becomes 4 under `--tsd-max 4`, and 0 under `--tsd-max 0`, which makes
+the same insertions with no TSD at all; `TSD=5-15` under `--tsd-max 10` draws from 5-10. Left at
+their defaults they clamp nothing, so a Tc1's `TSD=2` is not raised to 5. Changing the TSD
+changes nothing else: every insertion keeps its position, family and carriers.
 
 **Allele frequency.** `--af-dist exponential --af-mean M` draws each event's frequency from an
 exponential of mean `M`, truncated to `[--af-min, --af-max]`. Truncating an exponential from

@@ -1,4 +1,5 @@
 import re
+import hashlib
 import numpy as np
 from Bio import SeqIO
 from .utils import description_tail, parse_tsd_tag
@@ -64,8 +65,15 @@ class Simulator:
         self.num_genomes = args.num
         self.af_min = args.af_min
         self.af_max = args.af_max
-        self.tsd_min = args.tsd_min
-        self.tsd_max = args.tsd_max
+        # --tsd-min/--tsd-max name the range an insertion's TSD is drawn from when nothing else
+        # says, 5-20 unless given. Given explicitly, they also clamp what a TSD= tag says
+        # (tsd_clamp), so one library serves a series of runs that differ only in TSD: --tsd-max 0
+        # is the same insertions with no TSD at all.
+        given_min = getattr(args, "tsd_min", None)
+        given_max = getattr(args, "tsd_max", None)
+        self.tsd_clamp = (given_min if given_min is not None else 0, given_max)
+        self.tsd_min = given_min if given_min is not None else min(5, given_max if given_max is not None else 5)
+        self.tsd_max = given_max if given_max is not None else max(20, self.tsd_min)
         self.tsd_from_header = args.tsd_from_header
         self.af_dist = args.af_dist
         self.af_mean = args.af_mean
@@ -84,9 +92,6 @@ class Simulator:
         self.del_af_mean = args.del_af_mean if args.del_af_mean is not None else args.af_mean
         self.del_af_min = args.del_af_min if args.del_af_min is not None else args.af_min
         self.del_af_max = args.del_af_max if args.del_af_max is not None else args.af_max
-        # Only split the draw when a deletion spec was actually asked for. Splitting always
-        # would reorder the RNG stream for every mixed-type run, changing the output of runs
-        # that never wanted this feature; gating it keeps those byte-identical.
         self._af_by_type = any(getattr(args, f"del_af_{k}") is not None
                                for k in ("dist", "mean", "min", "max"))
         self.allow_zero_carriers = args.allow_zero_carriers
@@ -110,13 +115,33 @@ class Simulator:
         self.TEevents = []
         if self.random_seed is not None:
             np.random.seed(self.random_seed)
-        # A stream of its own for the draws that only happen sometimes -- the rescued carrier
-        # below, and the per-element TSD lengths read from a header. Taking those from the
-        # global stream would shift every draw after them, so two runs of the same seed that
-        # differed only in whether one event was rescued would differ in the TSD of every
-        # unrelated event downstream. Kept separate, the two runs differ in exactly the thing
-        # that changed, and stay diffable.
-        self._aux = np.random.default_rng(self.random_seed)
+        # Every event draws its allele frequency, genotypes, TSD and rescued carrier from streams
+        # of its own, seeded by the run's seed and the event itself (_event_rng). So an event comes
+        # out the same in every run of the seed that has it, whatever else the BED holds: adding
+        # deletions to a set of insertions, or excisions to both, leaves each insertion's carriers
+        # and TSD as they were, and a run differs from another in exactly the events that differ.
+        self._run_entropy = (self.random_seed if self.random_seed is not None
+                             else np.random.SeedSequence().entropy)
+    
+    # What an event's stream is for, mixed into its seed alongside the event.
+    _AF, _GT, _TSD, _RESCUE = range(4)
+
+    def _event_rng(self, event, purpose):
+        """The random stream for one purpose of one event: the run's seed, the event's contig,
+        span and ID, and the purpose, hashed together. The purpose keeps one draw from moving
+        another, so --num changes no TSD and --tsd-max no genotype."""
+        key = f'{event["chrom"]}\t{event["start"]}\t{event["end"]}\t{event["te_id"]}'.encode()
+        words = np.frombuffer(hashlib.sha256(key).digest()[:16], dtype=np.uint32).tolist()
+        return np.random.default_rng([self._run_entropy, purpose, *words])
+
+    def _clamp_tsd(self, bounds):
+        """A TSD= tag's (min, max) inside an explicit --tsd-min/--tsd-max. Clamping both ends keeps
+        a tag that falls wholly outside on the nearer bound: TSD=5 under --tsd-max 4 is 4."""
+        lo, hi = self.tsd_clamp
+        def clamp(x):
+            x = max(x, lo)
+            return x if hi is None else min(x, hi)
+        return clamp(bounds[0]), clamp(bounds[1])
     
     def _run(self):
         self._parse_bed()
@@ -226,19 +251,16 @@ class Simulator:
         print(f"[INFO] Parsed {len(self.TEevents)} TE events from BED.",file=sys.stderr)
         print(f"[INFO] Example event: {self.TEevents[0] if self.TEevents else 'No events'}",file=sys.stderr)
     
-    def _draw_afs(self, n, dist=None, mean=None, lo=None, hi=None):
-        """n allele frequencies from --af-dist, consuming exactly one uniform draw per event.
+    def _draw_afs(self, u, dist=None, mean=None, lo=None, hi=None):
+        """Allele frequencies from --af-dist, one per uniform in u (one per event, each from the
+        event's own stream).
 
-        "Exactly one" is load-bearing, not incidental. Every later draw in the run reads the
-        same global stream -- the genotype binomials here, and the TSD lengths in get_TE_tag --
-        so a distribution that consumed a different count would shift all of them, and
-        switching --af-dist would silently change the TSD of every event. numpy's
-        uniform(a, b, size=n) is a + (b-a)*random_sample(n) bit for bit, so drawing the
-        uniforms explicitly and transforming them leaves the stream exactly where the uniform
-        branch would have left it.
+        One uniform per event, transformed, so that an event's allele frequency is a function of
+        its own draw and the spec alone: switching --af-dist reshapes every frequency without
+        reshuffling which events are rare.
 
-        The exponential is sampled by inverse CDF for the same reason: rejection sampling
-        consumes an unpredictable number of draws. For rate lam truncated to [a, b],
+        The exponential is sampled by inverse CDF for the same reason. For rate lam truncated
+        to [a, b],
 
             F(x) = (1 - exp(-lam*(x-a))) / (1 - exp(-lam*(b-a)))
 
@@ -254,15 +276,12 @@ class Simulator:
         mean = self.af_mean if mean is None else mean
         a = self.af_min if lo is None else lo
         b = self.af_max if hi is None else hi
-        if n == 0:
-            return np.empty(0, dtype=float)
+        u = np.asarray(u, dtype=float)
         if dist == "uniform":
-            return np.random.uniform(a, b, size=n)
-        u = np.random.random_sample(n)
+            return a + (b - a) * u
         if b <= a:
-            # Degenerate truncation: one allowed value. The uniforms are still drawn, so the
-            # stream stays aligned with what the uniform branch would have consumed.
-            return np.full(n, a, dtype=float)
+            # Degenerate truncation: one allowed value.
+            return np.full(u.shape, a, dtype=float)
         lam = 1.0 / mean
         afs = a - np.log1p(u * np.expm1(-lam * (b - a))) / lam
         if dist == "reflected_exponential":
@@ -275,34 +294,27 @@ class Simulator:
             # the distribution rather than concentrating it near the top.
             afs = a + b - afs
         # Bounded by [a, b] analytically, but rounding as u approaches 1 can step a few ulp
-        # past b, and np.random.binomial rejects p > 1. That would be a seed-dependent crash
-        # in maybe one run in millions, which is the worst kind to leave in.
+        # past b, and a frequency above 1 is meaningless wherever it is read afterwards.
         return np.clip(afs, a, b)
 
-    def _draw_afs_by_type(self, events):
-        """One allele frequency per event, deletions drawn from the deletion spec.
-
-        Two draws rather than one, so the deletion group can take a different distribution.
-        That does consume the stream in a different order than the single-draw path -- all
-        non-deletion events, then all deletions -- which is why the caller only takes this
-        path when a --del-af-* option was actually given.
-        """
+    def _event_afs(self, events):
+        """One allele frequency per event, deletions drawn from the deletion spec (which is the
+        insertion's wherever no --del-af-* option was given)."""
         n = len(events)
+        u = np.array([self._event_rng(e, self._AF).random() for e in events], dtype=float)
         afs = np.empty(n, dtype=float)
         # A non-mobilizing SV is a deletion, but a new mutation rather than the absence of a
         # reference element, so it is rare like an insertion: GT=1 is the derived state.
-        is_del = [e["type"] == "DEL" and not e.get("nonmobilizing") for e in events]
-        del_idx = [i for i, d in enumerate(is_del) if d]
-        other_idx = [i for i, d in enumerate(is_del) if not d]
-        if other_idx:
-            afs[other_idx] = self._draw_afs(len(other_idx))
-        if del_idx:
-            afs[del_idx] = self._draw_afs(len(del_idx), dist=self.del_af_dist,
-                                          mean=self.del_af_mean, lo=self.del_af_min,
-                                          hi=self.del_af_max)
+        is_del = np.array([e["type"] == "DEL" and not e.get("nonmobilizing") for e in events], dtype=bool)
+        if (~is_del).any():
+            afs[~is_del] = self._draw_afs(u[~is_del])
+        if is_del.any():
+            afs[is_del] = self._draw_afs(u[is_del], dist=self.del_af_dist,
+                                         mean=self.del_af_mean, lo=self.del_af_min,
+                                         hi=self.del_af_max)
         return afs
 
-    def _rescue_zero_carriers(self, genotypes):
+    def _rescue_zero_carriers(self, events, genotypes):
         """Give one uniformly chosen genome to each event no genome drew, and count them.
 
         An event whose binomial roll comes up empty is skipped by generate_vcf and never
@@ -318,7 +330,7 @@ class Simulator:
             return 0
         empty = np.flatnonzero(genotypes.sum(axis=1) == 0)
         for row in empty:
-            genotypes[row, self._aux.integers(self.num_genomes)] = 1
+            genotypes[row, self._event_rng(events[row], self._RESCUE).integers(self.num_genomes)] = 1
         return int(empty.size)
 
     def _random_sample_genotypes(self):
@@ -336,18 +348,18 @@ class Simulator:
 
         # 2. sample genotypes
         for chrom in self.CHR:
-            nTE = len(self.CHR[chrom]["events"])
+            events = self.CHR[chrom]["events"]
+            nTE = len(events)
             nTE_total += nTE
-            if self._af_by_type:
-                afs = self._draw_afs_by_type(self.CHR[chrom]["events"])
-            else:
-                afs = self._draw_afs(nTE)
+            afs = self._event_afs(events)
             self.CHR[chrom]["genotypes"] = np.zeros((nTE, self.num_genomes), dtype=int)
             for i, af in enumerate(afs):
-                self.CHR[chrom]["genotypes"][i] = np.random.binomial(1, af, size=self.num_genomes)
+                # A Bernoulli(af) per genome, as a uniform below af.
+                self.CHR[chrom]["genotypes"][i] = (
+                    self._event_rng(events[i], self._GT).random(self.num_genomes) < af)
                 if len(afs_10) < 10:
                     afs_10.append(str(round(af,4)))
-            rescued += self._rescue_zero_carriers(self.CHR[chrom]["genotypes"])
+            rescued += self._rescue_zero_carriers(events, self.CHR[chrom]["genotypes"])
 
         print(f"[INFO] Generated genotypes for {nTE_total} events across {self.num_genomes} genomes.",file=sys.stderr)
         if self.af_dist != "uniform":
@@ -385,27 +397,23 @@ class Simulator:
         untagged = []
         for event in self.TEevents:
             chrom, start, end, te_id, strand = event["chrom"], event["start"], event["end"], event["te_id"], event["strand"]
-            # tsd length. Drawn unconditionally and overridden afterwards, rather than
-            # skipped, so that --tsd-from-header cannot move the global stream: an element
-            # whose header sets its own TSD still consumes the draw it would otherwise have
-            # used, leaving every later event -- including the deletions and excisions, which
-            # keep the flag-driven length -- exactly where it was. A header RANGE needs a
-            # number of its own, so it takes one from the auxiliary stream instead.
-            tsd_len = np.random.randint(self.tsd_min, self.tsd_max + 1)
+            # tsd length, from --tsd-min/--tsd-max, or from the element's TSD= tag clamped to an
+            # explicit --tsd-min/--tsd-max. Deletions and excisions duplicate nothing; theirs is
+            # drawn from the flags all the same and only ever reaches INFO/TSD.
+            lo, hi = self.tsd_min, self.tsd_max
             if te_id.startswith("bg") or event["nonmobilizing"]:
                 # Background SVs are synthetic sequence with no element behind them, so they
                 # duplicate nothing. Checked before the header lookup so they neither pick up
                 # a tag nor turn up in the untagged warning: bgSV writes them into the pool
                 # with no description at all.
-                tsd_len = 0
+                lo = hi = 0
             elif self.tsd_from_header and event["type"] == "INS":
                 bounds = te_tsd.get(te_id)
                 if bounds is None:
                     untagged.append(te_id)
-                elif bounds[0] == bounds[1]:
-                    tsd_len = bounds[0]
                 else:
-                    tsd_len = int(self._aux.integers(bounds[0], bounds[1] + 1))
+                    lo, hi = self._clamp_tsd(bounds)
+            tsd_len = lo if lo == hi else int(self._event_rng(event, self._TSD).integers(lo, hi + 1))
             if event["type"] == "INS":
                 # bed file is 0-based
                 ref_allele = self.CHR[chrom]["seq"][start - 1]

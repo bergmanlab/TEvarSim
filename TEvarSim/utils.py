@@ -63,8 +63,20 @@ def parse_tsd_tag(description: str, record_id: str = ""):
     return low, high
 
 
+# ---------------- one random stream per kind of event ----------------
+# TErandom's layers, in the order they are made. The number is mixed into the seed, so it
+# names a stream; renumbering one changes what every run of that seed makes.
+LAYER_INS, LAYER_DEL, LAYER_EXC = 1, 2, 3
+
+
+def layer_rng(seed, layer, *sub):
+    """The random stream of one layer of events under a run's seed (fresh entropy without one).
+    sub names a stream apart within the layer, for a draw whose size varies with a count."""
+    return np.random.default_rng(None if seed is None else [seed, layer, *sub])
+
+
 # ---------------- sampling TE insertions with min distance ----------------
-def sample_TEins(regions, deletions, n: int, TEdistance: int, target_strands: list[str|None]):
+def sample_TEins(regions, deletions, n: int, TEdistance: int, target_strands: list[str|None], rng=None):
     current_regions = np.array([[r[0], r[1], r[2], r[5]] for r in regions], dtype=object)
     
     def keep_TEdistance(regs, chrom, excl_start, excl_end):
@@ -118,7 +130,7 @@ def sample_TEins(regions, deletions, n: int, TEdistance: int, target_strands: li
             raise ValueError("TEdistance too large or genomic space exhausted.")
 
         # Select region
-        r_val = np.random.randint(0, total_len)
+        r_val = rng.integers(0, total_len) if rng is not None else np.random.randint(0, total_len)
         cum_lengths = np.cumsum(lengths)
         idx = np.searchsorted(cum_lengths, r_val, side='right')
 
@@ -225,6 +237,35 @@ def bgSV(bedin:str, bedout:str, nSV:int, ins_ratio:float, fasta_in:str, fasta_ou
     with open(bedout, "w") as fout:
         for r in rows:
             fout.write("\t".join(map(str, r)) + "\n")
+
+# ---------------- select TEs in a fixed order ----------------
+def take_stranded(order, TE_list: list, nTE: int, target_strands: list):
+    """nTE elements of TE_list, taken in the given order (a permutation of its indices), meeting
+    target_strands' count of "+" and "-" where the list allows and filling the rest from either.
+
+    Taking the first that fit, rather than sampling, nests the choice: without strand targets the
+    first k taken are the same whatever nTE is, so a run that asks for more deletions keeps every
+    deletion a run asking for fewer made. A strand with too few elements gives its shortfall to
+    either strand, as pick_stranded does.
+    """
+    need = {"+": target_strands.count("+"), "-": target_strands.count("-")}
+    either = nTE - need["+"] - need["-"]
+    chosen, passed = [], []
+    for i in order:
+        if len(chosen) == nTE:
+            break
+        strand = TE_list[i][6]
+        if need.get(strand, 0) > 0:
+            need[strand] -= 1
+            chosen.append(i)
+        elif either > 0:
+            either -= 1
+            chosen.append(i)
+        else:
+            passed.append(i)
+    chosen += passed[:nTE - len(chosen)]
+    return [TE_list[i] for i in chosen]
+
 
 # ---------------- select TEs with the restrict of minimum number ----------------
 def make_min_TE(TE_list: list, nMIN: int, nTE: int, TEtype: set, target_strands: list):

@@ -290,16 +290,21 @@ def main():
                          "without it a low --af-mean quietly discards most of the pool instead "
                          "of producing private insertions. The realised minimum allele "
                          "frequency is then 1/--num")
-    Simulate_parser.add_argument("--tsd-min", "-M", type=int, default=5, 
-                    help="Minimum TSD length (default: 5)")
-    Simulate_parser.add_argument("--tsd-max", "-Y", type=int, default=20, 
-                    help="Maximum TSD length (default: 20)")
+    Simulate_parser.add_argument("--tsd-min", "-M", type=int, default=None,
+                    help="Minimum TSD length (default: 5, or --tsd-max if that is lower). Given "
+                         "explicitly, it is also a floor on every TSD= tag --tsd-from-header reads")
+    Simulate_parser.add_argument("--tsd-max", "-Y", type=int, default=None,
+                    help="Maximum TSD length (default: 20, or --tsd-min if that is higher). Given "
+                         "explicitly, it is also a ceiling on every TSD= tag --tsd-from-header "
+                         "reads, so --tsd-max 0 makes every insertion without a TSD")
     Simulate_parser.add_argument("--tsd-from-header", action="store_true",
                     help="Take each insertion's TSD length from a TSD= tag in its pool FASTA "
                          "header, e.g. '>copia#LTR/Copia_3SNP TSD=5' or '... TSD=5-15' (both "
                          "bounds inclusive; TSD=0 means no duplication). The tag comes from the "
                          "--consensus library and is carried onto the pool by TErandom. "
-                         "Elements with no tag fall back to --tsd-min/--tsd-max. Applies to "
+                         "Elements with no tag fall back to --tsd-min/--tsd-max. A --tsd-min or "
+                         "--tsd-max given explicitly clamps the tag: TSD=5 is 5 under --tsd-min 2 "
+                         "--tsd-max 6, 4 under --tsd-max 4, and 0 under --tsd-max 0. Applies to "
                          "insertions only: deletions and excisions duplicate nothing")
     Simulate_parser.add_argument("--sense-strand-ratio", "-S", type=ratio, default=0.5, 
                     help="Proportion of TE variants in the sense strand (default: 0.5)")
@@ -498,10 +503,10 @@ def main():
         # unlike the allele frequency pair, which Simulator checks for itself.
         if args.bg_sv_rate < 0 or not 1 <= args.bg_sv_min <= args.bg_sv_max:
             Simulate_parser.error("--bg-sv-rate must be >= 0 and 1 <= --bg-sv-min <= --bg-sv-max")
-        if args.tsd_min > args.tsd_max:
+        if args.tsd_min is not None and args.tsd_max is not None and args.tsd_min > args.tsd_max:
             Simulate_parser.error("--tsd-min must be less than or equal to --tsd-max")
-        if args.tsd_min < 0:
-            Simulate_parser.error("--tsd-min must be non-negative")
+        if (args.tsd_min is not None and args.tsd_min < 0) or (args.tsd_max is not None and args.tsd_max < 0):
+            Simulate_parser.error("--tsd-min and --tsd-max must be non-negative")
         if args.af_dist in ("exponential", "reflected_exponential"):
             if args.af_mean is None or args.af_mean <= 0:
                 Simulate_parser.error(f"--af-dist {args.af_dist} requires --af-mean > 0")
