@@ -261,6 +261,7 @@ class RandomTE:
 
         self.nINS = args.nINS
         self.nDEL = args.nDEL
+        self.nNested = getattr(args, "nNested", 0) or 0
         self.nEXC = args.nEXC  # number of LTR-LTR recombinations (excisions)
         self.TEtype = TEtype(args.TEtype)
         self.prefix = args.outprefix
@@ -315,7 +316,8 @@ class RandomTE:
         # 1. place insertions, before anything else and knowing nothing of it
         self.parse_TEpool()
         # 2. parse DEL file (populates self.DEL, and self.EXC candidates for RepeatMasker input),
-        #    and drop every candidate an insertion landed in or beside
+        #    and drop every candidate with an insertion on or beside a breakpoint. An insertion
+        #    well inside an element is nested in it, and Simulate sorts out which genomes have it.
         self.parse_DEL()
         placed = [(i[0], i[1], i[2]) for i in self.INS] + self.placed
         self.DEL = self.clear_of(self.DEL, placed)
@@ -352,16 +354,19 @@ class RandomTE:
             bgSV(bedin, bedout, self.nSV, bg_ins_ratio, self.pool_fasta, self.out_fasta)
             logging.info(f"Generated BED file and fasta file with background SVs are: {bedout} and {self.out_fasta}")
 
+    def near_breakpoint(self, chrom, s, e, points):
+        """Whether an insertion point lies within --TEdistance of the span's start or end: on a
+        breakpoint it is neither inside the span nor clear of it."""
+        d = max(self.TEdistance, 1)
+        return any(s - d <= p < s + d or e - d <= p < e + d for p in points.get(chrom, ()))
+
     def clear_of(self, candidates, insertions):
-        """The candidates no insertion (chrom, start, end) lies in or within --TEdistance of: the
-        buffer insertions keep from each other, and the one they kept from deletions when they were
-        placed last."""
-        spans = {}
-        for chrom, start, end in insertions:
-            spans.setdefault(chrom, []).append((start, end))
-        d = self.TEdistance
-        return [c for c in candidates
-                if not any(c[1] - d <= e and s < c[2] + d for s, e in spans.get(c[0], ()))]
+        """The candidates no insertion (chrom, start, end) lies on or beside a breakpoint of. One
+        well inside a candidate is nested in it, which Simulate allows."""
+        points = {}
+        for chrom, start, _end in insertions:
+            points.setdefault(chrom, []).append(start)
+        return [c for c in candidates if not self.near_breakpoint(c[0], c[1], c[2], points)]
 
     def select_EXC(self):
         """Pick nEXC full-length LTR elements to excise from those no deletion took."""
@@ -410,9 +415,10 @@ class RandomTE:
         if self.nNM == 0:
             return
         rnd = random.Random(None if self.random_seed is None else self.random_seed + 4241)
-        taken = sorted([(d[0], d[1], d[2]) for d in self.DEL + self.EXC] +
-                       [(i[0], i[1] - self.TEdistance, i[2] + self.TEdistance)
-                        for i in [(x[0], x[1], x[2]) for x in self.INS] + self.placed])
+        taken = sorted((d[0], d[1], d[2]) for d in self.DEL + self.EXC)
+        ins_points = {}
+        for i in [(x[0], x[1], x[2]) for x in self.INS] + self.placed:
+            ins_points.setdefault(i[0], []).append(i[1])
         taken_by_chrom = {}
         for c, s, e in taken:
             taken_by_chrom.setdefault(c, []).append((s, e))
@@ -423,6 +429,8 @@ class RandomTE:
             if chrom not in self.CHR or s < 1 or e > self.CHR[chrom]:
                 return False
             if any(s < b and a < e for a, b in self.excluded.get(chrom, ())):
+                return False
+            if self.near_breakpoint(chrom, s, e, ins_points):
                 return False
             for a, b in taken_by_chrom.get(chrom, []) + chosen_spans.get(chrom, []):
                 if s < b + 1 and a < e + 1:     # neither overlapping nor abutting
@@ -472,14 +480,15 @@ class RandomTE:
     def build_bed(self):
         # merge INS, DEL, EXC and NM
         merged = self.INS + self.DEL + self.EXC + self.NM
-        merged.sort()
+        # A child shares its parent's position and comes after it.
+        merged.sort(key=lambda t: (t[0], t[1], t[2], len(t) > 7 and str(t[7]).startswith("HOST="), t[3]))
         # bedfile output
         bed_name = self.prefix + ".bed"
         check_output_file(bed_name)
         with open(bed_name, "w") as f:
             for chrom, start, end, teID, _cls, _typ, strand, *rest in merged:
                 cols = [chrom, str(start), str(end), teID, ".", strand]
-                if rest:  # EXC records carry the LTR length as a 7th column
+                if rest:  # EXC records carry the LTR length as a 7th column, children HOST=
                     cols.append(str(rest[0]))
                 f.write("\t".join(cols) + "\n")
         logging.info(f"Generated BED file: {bed_name}")
@@ -659,6 +668,33 @@ class RandomTE:
                               target_strands=self.ins_strands, rng=self.ins_rng)
         for record, (chrom, pos, strand) in zip(records,INSpos):
             self.INS.append((chrom, pos, pos, record.id, record.id.split("/")[1], "INS", strand))
+        self.nest_insertions(records)
+
+    def nest_insertions(self, records):
+        """Move --nNested of the insertions into others' inserted sequence. The children are the
+        first of the insertions in a fixed shuffled order (so more nested keeps the children fewer
+        made, though not necessarily their parents), each into a parent of
+        its own, chosen in proportion to its element's length, at an offset uniform inside it. A
+        child keeps the reference position it drew, unused, so the other insertions are where a run
+        without nesting would put them; it is written at its parent's position with
+        HOST=<parent position>:<offset> in the 7th column, and never hosts one itself."""
+        if not self.nNested:
+            return
+        if 2 * self.nNested > len(self.INS):
+            raise ValueError(f"--nNested {self.nNested} needs at least {2 * self.nNested} insertions, "
+                             f"one parent per child; there are {len(self.INS)}")
+        rng = layer_rng(self.random_seed, LAYER_INS, 2)
+        order = rng.permutation(len(self.INS))
+        children, parents = order[:self.nNested], order[self.nNested:]
+        lengths = np.array([len(records[i].seq) for i in parents], dtype=float)
+        chosen = rng.choice(len(parents), size=self.nNested, replace=False, p=lengths / lengths.sum())
+        for c, j in zip(children, chosen):
+            p = parents[j]
+            chrom, pos = self.INS[p][0], self.INS[p][1]
+            offset = int(rng.integers(1, len(records[p].seq)))
+            _, _, _, te_id, fam, typ, strand = self.INS[c]
+            self.INS[c] = (chrom, pos, pos, te_id, fam, typ, strand, f"HOST={pos}:{offset}")
+        logging.info(f"Nested {self.nNested} insertion(s) inside others")
 
 class TEPoolBuilder:
     def __init__(self, args):

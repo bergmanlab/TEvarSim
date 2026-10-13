@@ -110,10 +110,21 @@ def test_unsorted_within_a_contig_is_rejected():
         _expect_error(sim, "not sorted")
 
 
-def test_overlapping_events_are_rejected():
-    """An insertion falling inside a deletion's span -- the two-pass concatenation hazard."""
+def test_an_insertion_inside_a_deletion_is_nested():
+    """An insertion strictly inside a deletion's span landed in the deleted element: allowed,
+    and linked to its host, which decides which genomes have its site."""
     with tempfile.TemporaryDirectory() as d:
         sim = _simulator(d, [_del("chrA", 200, 300), _ins("chrA", 250)])
+        sim._check_bed()
+        dele, ins = sim.CHR["chrA"]["events"]
+        assert ins["host"] is dele
+
+
+def test_a_deletion_overlapping_an_insertion_is_still_rejected():
+    """Only an insertion may nest, and only strictly inside: a deletion over an earlier
+    insertion's point, or an insertion on a deletion's own breakpoint, is an overlap."""
+    with tempfile.TemporaryDirectory() as d:
+        sim = _simulator(d, [_del("chrA", 200, 300), _ins("chrA", 250), _del("chrA", 260, 280)])
         _expect_error(sim, "Overlapping")
 
 

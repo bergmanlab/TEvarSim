@@ -54,8 +54,12 @@ def _fixture(d):
 def _pool(d, name, n_del=0, n_exc=0, n_nm=0, seed=7, extra=()):
     ref, lib, dels, excs = _fixture(d)
     out = os.path.join(d, name)
+    n_ins = 20
+    if "--nINS" in extra:
+        i = extra.index("--nINS")
+        n_ins, extra = extra[i + 1], extra[:i] + extra[i + 2:]
     _tevarsim("TErandom", "--ref", ref, "--consensus", lib, "--existingTEs", dels,
-              "--excCandidates", excs, "--nINS", 20, "--nDEL", n_del, "--nEXC", n_exc,
+              "--excCandidates", excs, "--nINS", n_ins, "--nDEL", n_del, "--nEXC", n_exc,
               "--nNM", n_nm, "-A", 0, "-T", 0, "-S", 0, "-I", 0, "--seed", seed, "--outprefix", out,
               *extra)
     rows = [l.rstrip("\n").split("\t") for l in open(out + ".bed")]
@@ -122,13 +126,17 @@ def test_excisions_leave_the_deletions_alone_and_nest():
             assert not any(e[0] == x[0] and int(e[1]) < int(x[2]) and int(x[1]) < int(e[2]) for x in dels)
 
 
-def test_later_layers_keep_clear_of_insertions():
+def test_later_layers_keep_their_breakpoints_clear_of_insertions():
+    """An insertion may lie inside a deleted, excised or cut element (nested), never on or
+    beside one of its breakpoints."""
     with tempfile.TemporaryDirectory() as d:
-        _, rows = _pool(d, "a", n_del=10, n_exc=10, n_nm=6)
+        _, rows = _pool(d, "a", n_del=10, n_exc=5, n_nm=4, extra=("--nINS", 100))
         points = [int(r[1]) for r in _of(rows, "INS")]
         spans = [(int(r[1]), int(r[2])) for r in rows if r[3][:3] in ("DEL", "EXC", "NM-")]
+        d = 500     # TErandom's default --TEdistance
         for s, e in spans:
-            assert not any(s - 1 <= p < e + 1 for p in points), (s, e, points)
+            assert not any(s - d <= p < s + d or e - d <= p < e + d for p in points), (s, e)
+        assert any(s < p < e for s, e in spans for p in points), "no insertion landed in a reference event"
 
 
 def test_simulate_gives_a_shared_insertion_the_same_carriers_and_tsd():
@@ -147,8 +155,53 @@ def test_simulate_gives_a_shared_insertion_the_same_carriers_and_tsd():
                              if "SVTYPE=INS" in r[7] or "TYPE=INS" in r[7]})
         alone, mixed = recs
         assert alone, "no insertion reached a genome"
-        assert alone == {k: v for k, v in mixed.items() if k in alone}, "an insertion changed"
-        assert set(alone) == set(mixed), "the same insertions should be the only ones"
+        # The same insertions, the same alleles, the same genotypes -- except where a deletion or
+        # excision took an insertion's site away (".") and named itself its HOST.
+        for k, (ref_a, alt_a, info_a, gts_a) in alone.items():
+            if k not in mixed:      # every carrier lost its site
+                continue
+            ref_m, alt_m, info_m, gts_m = mixed[k]
+            assert (ref_a, alt_a) == (ref_m, alt_m), k
+            assert info_m.split(";HOST=")[0] == info_a, k
+            assert all(m == a for a, m in zip(gts_a, gts_m) if m != "."), k
+        assert set(mixed) <= set(alone), "no insertion should appear that a run without them lacks"
+
+
+def test_nested_insertions_go_into_others():
+    with tempfile.TemporaryDirectory() as d:
+        _, flat = _pool(d, "flat")
+        _, three = _pool(d, "three", extra=("--nNested", 3))
+        _, five = _pool(d, "five", extra=("--nNested", 5))
+        def kids(rows):
+            return [r for r in rows if len(r) > 6 and r[6].startswith("HOST=")]
+        k3, k5 = kids(three), kids(five)
+        assert len(k3) == 3 and len(k5) == 5
+        for rows in (three, five):
+            ins = [r for r in rows if r not in kids(rows)]
+            for i, r in enumerate(rows):
+                if r in kids(rows):
+                    pos, off = map(int, r[6][5:].split(":"))
+                    parent = rows[i - 1]
+                    assert int(r[1]) == pos == int(parent[1]) and parent not in kids(rows), (r, parent)
+                    assert 0 < off
+            parents = [rows[i - 1][1] for i, r in enumerate(rows) if r in kids(rows)]
+            assert len(set(parents)) == len(parents), "one child per parent"
+        # Every insertion that is not a child is where the flat run put it.
+        flat_ins = {tuple(r[:2]) for r in flat}
+        assert all(tuple(r[:2]) in flat_ins for r in five)
+        assert len(five) == len(three) == len(flat)
+
+
+def test_simulate_takes_a_nested_pool():
+    with tempfile.TemporaryDirectory() as d:
+        ref = _fixture(d)[0]
+        out, _ = _pool(d, "n", n_del=5, n_exc=3, extra=("--nNested", 4))
+        _tevarsim("Simulate", "--ref", ref, "--bed", out + ".bed", "--pool", out + ".fa", "--num", 10,
+                  "--af-min", 0.5, "--af-max", 0.5, "--allow-zero-carriers", "--tsd-from-header",
+                  "--seed", 7, "-O", out + "_sim")
+        with open(out + "_sim.vcf") as f:
+            hosted = [l for l in f if not l.startswith("#") and ";HOST=" in l]
+        assert hosted, "no nested insertion reached a genome"
 
 
 if __name__ == "__main__":

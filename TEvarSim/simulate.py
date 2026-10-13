@@ -176,18 +176,37 @@ class Simulator:
         # and then by position, which is exactly what TErandom writes, at every contig boundary.
         # A bed whose contigs are interleaved is still accepted, so long as each contig's own
         # events ascend and none of them overlap.
+        #
+        # Two kinds of overlap are allowed, both of an insertion with the sequence it landed in:
+        # an insertion strictly inside a deletion, excision or non-mobilizing SV (a reference
+        # element, or the span a non-mobilizing SV takes) is NESTED in it, and an insertion with
+        # HOST=<pos>:<offset> in the BED's 7th column is the CHILD of the insertion at that
+        # position, inside its inserted sequence. A genome without the host sequence cannot carry
+        # what was inserted into it; _mask_nested sorts that out once genotypes are drawn.
         previous = {}
         for event in self.TEevents:
             chrom = event["chrom"]
             start = event["start"]
             end = event["end"]
             if start > end:
-                raise ValueError(f"Invalid TE event: start >= end. Position: {start}")
+                raise ValueError(f"Invalid TE event: start >= end. Position: {chrom}\t{start}")
             if chrom not in self.CHR:
                 raise ValueError(f"Contig not found in reference: {chrom}")
             if start < 0 or end > self.CHR[chrom]["len"]:
                 raise ValueError(f"TE event out of genome bounds. Position: {chrom}\t{start}\t{end}")
-            prev_start, prev_end = previous.get(chrom, (-1, -1))
+            prev_start, prev_end, host, last_ins = previous.get(chrom, (-1, -1, None, None))
+            if event.get("host_pos") is not None:
+                if (last_ins is None or last_ins["start"] != event["host_pos"]
+                        or last_ins.get("parent") is not None or last_ins.get("child") is not None):
+                    raise ValueError(
+                        f"HOST={event['host_pos']}:{event['host_offset']} at {chrom}\t{start} names no "
+                        f"insertion just before it: a child follows its parent, one child per parent, "
+                        f"and a child is never a parent")
+                event["parent"] = last_ins
+                last_ins["child"] = event
+                event["host"] = last_ins.get("host")
+                self.CHR[chrom]["events"].append(event)
+                continue
             # Unsorted is diagnosed before overlapping because it is the more likely cause and
             # the more useful thing to be told: an out-of-order event always overlaps the one
             # before it as well, so the overlap message alone would point at a symptom.
@@ -198,10 +217,19 @@ class Simulator:
             # An insertion is a point event (start == end), so two of them at the same position
             # are adjacent rather than overlapping and the comparison stays strict.
             if start < prev_end:
-                raise ValueError(
-                    f"Overlapping TE events detected. Position: {chrom}\t{start}, which "
-                    f"starts inside the event ending at {prev_end}")
-            previous[chrom] = (start, end)
+                if not (event["type"] == "INS" and not event["background"] and host is not None
+                        and host["start"] < start < host["end"]):
+                    raise ValueError(
+                        f"Overlapping TE events detected. Position: {chrom}\t{start}, which "
+                        f"starts inside the event ending at {prev_end}")
+                event["host"] = host
+            elif event["type"] != "INS" and not event["background"]:
+                host = event
+            else:
+                host = None
+            if event["type"] == "INS":
+                last_ins = event
+            previous[chrom] = (start, max(end, prev_end), host, last_ins)
             self.CHR[chrom]["events"].append(event)
 
     def _parse_bed(self):
@@ -235,6 +263,11 @@ class Simulator:
                 else:
                     # A non-mobilizing SV (TErandom --nNM) is a deletion of whatever span it names.
                     event_type = "INS" if end-start <= 1 and not te_id.startswith("NM-") else "DEL"
+                # An insertion into another insertion's sequence (TErandom --nNested): 7th column
+                # HOST=<the parent's position>:<offset into its inserted sequence>.
+                host_pos = host_offset = None
+                if len(line) > 6 and line[6].startswith("HOST="):
+                    host_pos, host_offset = map(int, line[6][5:].split(":"))
                 self.TEevents.append({
                     "chrom":chrom,
                     "start": start,
@@ -247,6 +280,8 @@ class Simulator:
                     "background": te_id.startswith("bg"),
                     # TErandom --nNM: in the genomes, in <prefix>.nonmobilizing.vcf, never TE truth.
                     "nonmobilizing": te_id.startswith("NM-"),
+                    "host_pos": host_pos,
+                    "host_offset": host_offset,
                 })
         print(f"[INFO] Parsed {len(self.TEevents)} TE events from BED.",file=sys.stderr)
         print(f"[INFO] Example event: {self.TEevents[0] if self.TEevents else 'No events'}",file=sys.stderr)
@@ -314,7 +349,34 @@ class Simulator:
                                          hi=self.del_af_max)
         return afs
 
-    def _rescue_zero_carriers(self, events, genotypes):
+    def _mask_nested(self, events, genotypes):
+        """Take each nested insertion away from the genomes that lack the sequence it landed in.
+
+        Every event draws its carriers alone, so a nested insertion's drawn genotypes are the same
+        whatever its host does, and a run with the host's deletion differs from one without it only
+        where it has to. A genome lacks the insertion's site when it carries the host's deletion or
+        non-mobilizing SV, or its excision -- unless the insertion lies in the 5' LTR the excision
+        leaves -- or, for a child, when it lacks the parent insertion. Those genomes are recorded
+        as having no site at all (event["applicable"]), which the truth VCF writes as ".", not as
+        "does not carry". Events come in file order, so a host's row is final before its nested
+        insertions are read against it.
+        """
+        row_of = {id(e): i for i, e in enumerate(events)}
+        for i, e in enumerate(events):
+            if e.get("parent") is not None:
+                site = genotypes[row_of[id(e["parent"])]].astype(bool)
+            elif e.get("host") is not None:
+                h = e["host"]
+                carried = genotypes[row_of[id(h)]].astype(bool)
+                site = ~carried
+                if h["type"] == "EXC" and e["start"] < h["start"] + h["ltr_len"]:
+                    site |= carried
+            else:
+                continue
+            e["applicable"] = site
+            genotypes[i] &= site
+
+    def _rescue_zero_carriers(self, events, genotypes, nested=None):
         """Give one uniformly chosen genome to each event no genome drew, and count them.
 
         An event whose binomial roll comes up empty is skipped by generate_vcf and never
@@ -324,14 +386,24 @@ class Simulator:
         produces an almost empty one.
 
         Modifies genotypes in place. A no-op at allele frequency 1, since a row of ones is
-        never empty, so lineage simulations are unaffected.
+        never empty, so lineage simulations are unaffected. nested=False takes only events that
+        are not nested in another, nested=True only those that are, None every event.
         """
         if self.allow_zero_carriers or self.num_genomes == 0 or genotypes.size == 0:
             return 0
         empty = np.flatnonzero(genotypes.sum(axis=1) == 0)
+        rescued = 0
         for row in empty:
-            genotypes[row, self._event_rng(events[row], self._RESCUE).integers(self.num_genomes)] = 1
-        return int(empty.size)
+            is_nested = events[row].get("host") is not None or events[row].get("parent") is not None
+            if nested is not None and is_nested != nested:
+                continue
+            # Only a genome with the site can carry it; a nested insertion none has stays empty.
+            site = events[row].get("applicable")
+            allowed = np.arange(self.num_genomes) if site is None else np.flatnonzero(site)
+            if allowed.size:
+                genotypes[row, allowed[self._event_rng(events[row], self._RESCUE).integers(allowed.size)]] = 1
+                rescued += 1
+        return rescued
 
     def _random_sample_genotypes(self):
         """
@@ -359,7 +431,12 @@ class Simulator:
                     self._event_rng(events[i], self._GT).random(self.num_genomes) < af)
                 if len(afs_10) < 10:
                     afs_10.append(str(round(af,4)))
-            rescued += self._rescue_zero_carriers(events, self.CHR[chrom]["genotypes"])
+            # Hosts first, so a rescued carrier of a host is read as one by the masking; then the
+            # nested insertions, among the genomes that still have their site.
+            gts = self.CHR[chrom]["genotypes"]
+            rescued += self._rescue_zero_carriers(events, gts, nested=False)
+            self._mask_nested(events, gts)
+            rescued += self._rescue_zero_carriers(events, gts, nested=True)
 
         print(f"[INFO] Generated genotypes for {nTE_total} events across {self.num_genomes} genomes.",file=sys.stderr)
         if self.af_dist != "uniform":
@@ -414,7 +491,29 @@ class Simulator:
                 else:
                     lo, hi = self._clamp_tsd(bounds)
             tsd_len = lo if lo == hi else int(self._event_rng(event, self._TSD).integers(lo, hi + 1))
-            if event["type"] == "INS":
+            if event.get("parent") is not None:
+                # An insertion into an insertion: the parent's allele with this element inside its
+                # inserted sequence, offset bases in, duplicating the parent's bases just 5' of the
+                # cut. The ALT is the whole allele a carrier has at the parent's anchor, so a genome
+                # that carries both reads the same sequence from either record.
+                parent = event["parent"]
+                inserted = parent["alt"][1:]            # the parent element, oriented, and its TSD
+                element_len = len(inserted) - parent["tsd_len"]
+                k = event["host_offset"]
+                if not 0 < k < element_len:
+                    raise ValueError(f"HOST offset {k} at {chrom}\t{start} is not inside the parent "
+                                     f"element ({element_len} bp)")
+                try:
+                    te_seq = te_pool[te_id]
+                except KeyError:
+                    raise ValueError(f"TE sequence {te_id} not found in {self.pool_fasta}")
+                if strand == "-":
+                    te_seq = te_seq.reverse_complement()
+                child_insert = str(te_seq) + inserted[max(0, k - tsd_len):k]
+                event["child_insert"] = child_insert
+                ref_allele = parent["ref"]
+                alt_allele = parent["alt"][0] + inserted[:k] + child_insert + inserted[k:]
+            elif event["type"] == "INS":
                 # bed file is 0-based
                 ref_allele = self.CHR[chrom]["seq"][start - 1]
                 try:
@@ -772,6 +871,7 @@ class Simulator:
             vcf.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Net length change of the variant, negative for excision (EXC only)">\n')
             vcf.write('##INFO=<ID=TSD,Number=1,Type=Integer,Description="Target site duplication length: for an insertion the ALT allele ends with the TSD bases immediately 5\' of POS. Meaningless for DEL and EXC, which duplicate nothing">\n')
             vcf.write('##INFO=<ID=TEFAMILY,Number=1,Type=String,Description="TE family ID from consensus">\n')
+            vcf.write('##INFO=<ID=HOST,Number=1,Type=String,Description="The event this insertion landed in, as CHROM:POS:ID: a reference event (DEL, EXC, or a non-mobilizing SV in the .nonmobilizing.vcf) whose span holds POS, or the insertion at the same POS into whose inserted sequence it went, in which case ALT is that whole allele with this element inside. GT is . in a genome without the host sequence (no site to carry), 0 in one with the host sequence but not this insertion">\n')
             vcf.write('##INFO=<ID=SNP,Number=1,Type=Integer,Description="Number of SNP modifications in TE sequence">\n')
             vcf.write('##INFO=<ID=INDEL,Number=1,Type=Integer,Description="Number of INDEL modifications in TE sequence">\n')
             vcf.write('##INFO=<ID=polyA,Number=1,Type=Integer,Description="Length of added polyA tail in TE sequence">\n')
@@ -784,9 +884,11 @@ class Simulator:
                 for idx, event in enumerate(chr_info["events"]):
                     if event.get("background") or event.get("nonmobilizing"):
                         continue    # written to the background or non-mobilizing VCF instead: not TE truth
-                    genotypes = list(map(str, chr_info["genotypes"][idx]))
-                    if all(g=="0" for g in genotypes):
+                    row = chr_info["genotypes"][idx]
+                    if not row.any():
                         continue
+                    site = event.get("applicable")
+                    genotypes = [str(g) if site is None or site[i] else "." for i, g in enumerate(row)]
                     # Although BED files are 0-based and VCF files are 1-based, 
                     # VCF files require retrieving one base upstream, so the overall position remains unchanged.
                     pos = event["start"]
@@ -820,6 +922,9 @@ class Simulator:
                     elif event_type == "EXC":
                         info_parts.append(f"LTRLEN={event['ltr_len']}")
                         info_parts.append(f"SVLEN={len(alt) - len(ref)}")
+                    host = event.get("parent") or event.get("host")
+                    if host is not None:
+                        info_parts.append(f"HOST={host['chrom']}:{host['start']}:{host['te_id']}")
 
                     info_str = ";".join(info_parts)
                     vcf.write(f"{chrom}\t{pos}\t{var_id}\t{ref}\t{alt}\t.\tPASS\t{info_str}\tGT\t" + "\t".join(genotypes) + "\n")
@@ -831,129 +936,105 @@ class Simulator:
         """
         Generate the genome sequence for each sample based on the genotype matrix and variant information.
 
-        Memory, measured rather than guessed, because this is the step that holds the most:
-        80,000 events into 100 D. melanogaster genomes (137Mb reference) peaks at 1.45GB and
-        takes 98 seconds. It is nearly flat in population size -- 1.30GB at 5 genomes -- since
-        one contig of one genome is assembled at a time. Peak tracks the reference size plus
-        the total inserted sequence, so it is a genome-size problem, not a sample-size one, and
-        a human-scale reference would be roughly an order of magnitude more.
-
-        That is comfortable at the scales this is used at, so the obvious reductions are left
-        undone. Recorded here because they are not obvious from reading the code, and because
-        a bigger reference would make them worth taking. Measured together at 0.90GB, a 38%
-        saving, with byte-identical output and no change in runtime:
-
-          - Build and write ONE CONTIG at a time. Every contig's chunk list currently coexists,
-            because the first loop below fills them all before the writer runs. Freeing each
-            after it is written is the largest single saving, and the output order is already
-            contig-major so it does not move a byte.
-          - Drop each event's "ref"/"alt" once it is in chunks. generate_vcf has already run by
-            then, and chunks.append(event["alt"][1:]) is a second copy of every element.
-          - Free chr_info["seq"] once its contig is chunked.
-          - indexMat as bool rather than float64 (128MB -> 16MB at 80k events x 100 genomes).
-
-        The last one has a trap. A column slice indexMat[:, idx] is a VIEW, so the
-        mask[flipped] = ~mask[flipped] below would write through and corrupt the matrix for
-        every later genome. This code is safe only because .astype(bool) happens to copy; a
-        bool matrix needs an explicit .copy() there.
+        Memory, as measured before nested insertions: 80,000 events into 100 D. melanogaster
+        genomes (137Mb reference) peaked at 1.45GB in 98 seconds, nearly flat in population size
+        (1.30GB at 5 genomes), tracking the reference plus the total inserted sequence. Chunks
+        are now built and written one contig at a time (_contig_chunks), the largest of the
+        savings that measurement identified; each chunk holds a bool presence vector, or None
+        for a chunk every genome holds.
         """
-        # split genome
-        for chrom,chr_info in self.CHR.items():
-            if not chr_info["events"]:
-                continue
-            for event_idx, event in enumerate(chr_info["events"]):
-                # events MUST be sorted
-                SVtype = event['type']
-                left = event['start']
-                right = event['end']
-                if left != chr_info["start"]:
-                    chr_info["chunks"].append(
-                        chr_info["seq"][chr_info["start"]:left]
-                    )
-                    chr_info["col_index"] += 1
-                if SVtype == "INS":
-                    chr_info["chunks"].append(event["alt"][1:])
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                elif SVtype == "SNP":
-                    # Background substitution: the reference base when the genotype is 0
-                    # (flipped, like a deletion), the alternative base when it is 1.
-                    chr_info["chunks"].append(event["ref"])
-                    chr_info["flipped"].append(chr_info["col_index"])
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                    chr_info["col_index"] += 1
-                    chr_info["chunks"].append(event["alt"])
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                elif SVtype == "EXC":
-                    # Substitution: the full element chunk is present when the genotype is 0
-                    # (flipped, like a deletion) and the solo LTR chunk when it is 1. Both
-                    # chunks are driven by the same event genotype row.
-                    chr_info["chunks"].append(event["ref"][1:])   # full LTR-I-LTR element
-                    chr_info["flipped"].append(chr_info["col_index"])
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                    chr_info["col_index"] += 1
-                    chr_info["chunks"].append(event["alt"][1:])   # solo LTR
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                else:
-                    chr_info["chunks"].append(event["ref"][1:])
-                    chr_info["flipped"].append(chr_info["col_index"])
-                    chr_info["cols_to_replace"].append(chr_info["col_index"])
-                    chr_info["gt_row"].append(event_idx)
-                chr_info["col_index"] += 1
-                chr_info["start"] = right
-
-            # Check if the last TE occurs at the end of the genome
-            genome_len = chr_info["len"]
-            if right != genome_len:
-                chr_info["chunks"].append(chr_info["seq"][right:genome_len])
-
-        # combine genome
         if self.diverse:
             print("introduce sequence diversity for each TE-events",file=sys.stderr)
-
-
+        divConfig = Get_config(self.diverse_config) if self.diverse and self.diverse_config else {}
         with ExitStack() as stack:
             files = [stack.enter_context(open(f"{self.output_prefix}_{i}.fa","w")) for i in range(self.num_genomes)]
-            for chrom,chr_info in self.CHR.items():
-                if not chr_info["events"]:
-                    for idx in range(self.num_genomes):
-                        files[idx].write(f">{chrom}_{idx}\n")
-                        for i in range(0, chr_info["len"], 60):
-                            files[idx].write(chr_info["seq"][i:i+60] + "\n")
-                    continue
-                chunks = chr_info["chunks"]
-                cols_to_replace = chr_info["cols_to_replace"]
-                flipped = chr_info["flipped"]
-                indexMat = np.ones((len(chunks), self.num_genomes))
-                # Each genotype-controlled chunk copies the genotype row of its source event.
-                # A single event may drive more than one chunk (EXC: full element + solo LTR),
-                # so map chunk -> event row explicitly rather than assuming a 1:1 layout.
-                for chunk_idx, ev in zip(cols_to_replace, chr_info["gt_row"]):
-                    indexMat[chunk_idx] = chr_info["genotypes"][ev]
+            for chrom, chr_info in self.CHR.items():
+                chunks = self._contig_chunks(chr_info)
                 for idx in range(self.num_genomes):
-                    mask = indexMat[:, idx].astype(bool)
-                    mask[flipped] = ~mask[flipped]
+                    present = [(c, te) for c, p, te in chunks if p is None or p[idx]]
                     if self.diverse:
-                        # introduce sequence diversity for each TE-events (not background ones)
-                        te_cols = {c for c, ev in zip(cols_to_replace, chr_info["gt_row"])
-                                   if not (chr_info["events"][ev].get("background")
-                                           or chr_info["events"][ev].get("nonmobilizing"))}
-                        mask_seq = [m if i in te_cols else 0 for i, m in enumerate(mask)]
-                        if self.diverse_config:
-                            divConfig = Get_config(self.diverse_config)
-                            diverse_chunks = [SeqDiverse(chunk, **divConfig) if use else chunk for chunk, use in zip(chunks, mask_seq)]
-                        else:
-                            diverse_chunks = [SeqDiverse(chunk) if use else chunk for chunk, use in zip(chunks, mask_seq)]
-                        assembly = ''.join(chunk for chunk, use in zip(diverse_chunks, mask) if use)
+                        # sequence diversity for each TE event's own sequence (not background's)
+                        assembly = ''.join(SeqDiverse(c, **divConfig) if te else c for c, te in present)
                     else:
-                        assembly = ''.join(chunk for chunk, use in zip(chunks, mask) if use)
+                        assembly = ''.join(c for c, _ in present)
                     files[idx].write(f">{chrom}_{idx}\n")
                     for i in range(0, len(assembly), 60):
                         files[idx].write(assembly[i:i+60] + "\n")
+
+    def _contig_chunks(self, chr_info):
+        """One contig as (sequence, presence, is_te) chunks: presence is the bool vector of the
+        genomes that hold the chunk, or None for every genome; is_te marks a TE event's own
+        sequence, which --diverse mutates.
+
+        Walking the events in order, each top-level event contributes its alleles' chunks: an
+        insertion its sequence (split around a child's, which only the child's carriers hold), a
+        deletion or non-mobilizing SV its span (held by the genomes that do not carry it), an
+        excision the full element and the solo LTR, a background SNP its two bases. An insertion
+        nested in a reference event splits that event's span at its point, in each allele that
+        still has the point -- the solo LTR as well as the full element when it lies in the 5'
+        LTR -- and is held by its carriers among the genomes holding that allele.
+        """
+        seq, events = chr_info["seq"], chr_info["events"]
+        genotypes = chr_info["genotypes"]
+        rows = {id(e): genotypes[i].astype(bool) for i, e in enumerate(events)}
+        nested_in, tops = {}, []
+        for e in events:
+            if e.get("parent") is not None:
+                continue                        # reached through its parent
+            if e.get("host") is not None:
+                nested_in.setdefault(id(e["host"]), []).append(e)
+            else:
+                tops.append(e)
+        chunks = []
+
+        def both(a, b):
+            return a if b is None else a & b
+
+        def emit_ins(e, cond):
+            held = both(rows[id(e)], cond)
+            te = not e.get("background")
+            child = e.get("child")
+            inserted = e["alt"][1:]
+            if child is None:
+                chunks.append((inserted, held, te))
+                return
+            k = child["host_offset"]
+            chunks.append((inserted[:k], held, te))
+            chunks.append((child["child_insert"], both(rows[id(child)], cond), True))
+            chunks.append((inserted[k:], held, te))
+
+        def emit_span(lo, hi, held, inner, te):
+            cur = lo
+            for x in inner:
+                if lo < x["start"] < hi:
+                    chunks.append((seq[cur:x["start"]], held, te))
+                    emit_ins(x, held)
+                    cur = x["start"]
+            chunks.append((seq[cur:hi], held, te))
+
+        cursor = 0
+        for e in tops:
+            lo, hi = e["start"], e["end"]
+            if lo > cursor:
+                chunks.append((seq[cursor:lo], None, False))
+            te = not (e.get("background") or e.get("nonmobilizing"))
+            carried = rows[id(e)]
+            inner = nested_in.get(id(e), [])
+            if e["type"] == "INS":
+                emit_ins(e, None)
+            elif e["type"] == "SNP":
+                # Background substitution: the reference base without it, the other base with it.
+                chunks.append((e["ref"], ~carried, te))
+                chunks.append((e["alt"], carried, te))
+            elif e["type"] == "EXC":
+                emit_span(lo, hi, ~carried, inner, te)                         # the full element
+                emit_span(lo, lo + e["ltr_len"], carried, inner, te)           # the solo LTR left
+            else:
+                emit_span(lo, hi, ~carried, inner, te)
+            cursor = max(cursor, hi)
+        if cursor < chr_info["len"]:
+            chunks.append((seq[cursor:chr_info["len"]], None, False))
+        return chunks
 
 def run(args):
     Simulator(args)._run()

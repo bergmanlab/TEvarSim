@@ -80,6 +80,8 @@ class Locus:
         self.match = None           # the prediction record paired with this locus
         self.displaced = None       # a call that found it, but one solo LTR downstream
         self.index = None           # position in the truth file
+        self.host = None            # the truth locus this insertion landed in (INFO/HOST), if any
+        self.nested = []            # the truth loci that landed in this one
 
 
 class VcfRow:
@@ -334,12 +336,38 @@ def load_truth_events(vcf_file, INSonly, TEtype):
         event.text = text
         events.append(event)
         rows.append(VcfRow(index, record.chrom, record.pos, text, scored=event))
+    link_hosts(events)
     if wanted is not None and not any(f.casefold() == wanted for f in seen_families):
         raise ValueError(
             f"--TEtype '{TEtype}' matches no TE family in {vcf_file}. "
             f"Families present: {', '.join(sorted(seen_families))}. "
             "Note --TEtype matches the family (e.g. TY1-FULL), not the superfamily (Copia).")
     return events, samples, rows
+
+
+def link_hosts(events):
+    '''
+    Join each nested insertion to the locus it landed in (INFO/HOST=CHROM:POS:ID, Simulate).
+
+    A host absent from the file -- a non-mobilizing SV, which has a VCF of its own, or a
+    deletion no genome carried -- leaves the insertion unlinked: it is scored as any other.
+    '''
+    by_key = {f"{e.chrom}:{e.pos}:{e.id}": e for e in events}
+    for e in events:
+        host = by_key.get(e.info.get("HOST")) if e.info.get("HOST") else None
+        if host is not None and host is not e:
+            e.host = host
+            host.nested.append(e)
+
+
+def descendants(event):
+    '''Every truth locus nested in this one, at any depth.'''
+    out, stack = [], list(event.nested)
+    while stack:
+        e = stack.pop()
+        out.append(e)
+        stack.extend(e.nested)
+    return out
 
 
 # A carrier-info value marking less than this fraction of the REF value's annotated bp is a remnant of the REF element
@@ -612,8 +640,13 @@ def carries_event(event, neighbours, tsample, p_descs):
     if not sizes or any(d.symbolic for d in p_descs if d.idx != 0) or \
             any(t.symbolic or t.size is None for t in event.alt_descs) or not event.alt_descs:
         return True                 # nothing comparable by length: every non-reference allele counts, as before
+    # An insertion nested in this event is carried only with it: an allele that is this event with
+    # an insertion inside is this event's as well, and a nested insertion is no rival for it.
+    inner = descendants(event)
+    own = list(event.alt_descs) + [t for n in inner for t in n.alt_descs if not t.symbolic and t.size]
+    neighbours = [n for n in neighbours if not any(n is i for i in inner)]
     for size in sizes:
-        sized = [t.size for t in event.alt_descs
+        sized = [t.size for t in own
                  if t.size and (size > 0) == (t.size > 0)
                  and abs(size - t.size) <= EVENT_ALT_LENGTH_FRACTION * abs(t.size)]
         if not sized:
@@ -738,6 +771,17 @@ def match_events(events, records, max_dist, tol):
         # from a prediction back to the locus that claimed it as well as the other way.
         by_chrom[chrom][j].matched_for = events[i]
     match_displaced(events, by_chrom, taken_events, taken_records, max_dist, tol)
+    # A nested insertion may share its host's record: a caller writing an element and the same
+    # element with an insertion inside as two ALTs of one record has called both. Only where that
+    # record has an allele agreeing with the nested insertion, and within --max_dist of it.
+    for event in events:
+        host = event.host
+        if event.match is not None or host is None or host.match is None:
+            continue
+        record = host.match
+        if abs(pred_offset(record, event.pos)) <= max_dist and \
+                alleles_overlap(event.alt_descs, record.alt_descs, tol):
+            event.match = record
 
 
 def ltr_shift(event):
@@ -842,8 +886,14 @@ def score_event(event, pairs, tol, neighbours=()):
     multi = match is not None and \
         len([a for a in (match.alts or ()) if a != "<*>"]) > 1
     untyped = []
+    no_site = []
     for tsample, psample in pairs:
         t_gt = event.gts.get(tsample, (None,))
+        if event.host is not None and all(a is None for a in t_gt):
+            # A nested insertion's "." genome lacks the host sequence: there is no site to call,
+            # so it is neither carrier nor non-carrier here. The host's locus scores that genome.
+            no_site.append(tsample)
+            continue
         t_carrier = is_carrier(t_gt, {0})
         if t_carrier:
             truth_carriers.append(tsample)
@@ -907,6 +957,8 @@ def score_event(event, pairs, tol, neighbours=()):
     scored["unsupported_events"] = unsupported
     scored["family"] = event.family
     scored["superfamily"] = event.superfamily
+    scored["host"] = None if event.host is None else event.host.id
+    scored["no_site"] = no_site
     scored["size_bp"] = event.size
     scored["allele_frequency"] = round(ac / an, 4) if an else None
     scored["allele_count"] = ac

@@ -166,8 +166,9 @@ excisions and insertions are those a run without them would make.
 
 **Layers, for series of simulations.** TErandom makes its events in layers, in this order:
 insertions, deletions, excisions, non-mobilizing SVs. Each layer draws from a random stream of its
-own under `--seed` and keeps clear of every layer before it (an `--existingTEs` element an insertion
-landed in, or within `--TEdistance` of, is never deleted or excised), never the reverse. Deletions
+own under `--seed` and keeps its breakpoints at least `--TEdistance` from every insertion, never the
+reverse; an insertion well inside an element that is then deleted or excised is nested in it (see
+**Nested insertions** below). Deletions
 and excisions are taken in a fixed shuffled order, so asking for more of them adds to the set. Runs
 that share a seed and the insertion arguments therefore share their insertions -- positions,
 families, strands, sequences -- whatever deletions, excisions or non-mobilizing SVs they add, and
@@ -276,6 +277,25 @@ TE event or of one another, nor over an N. A duplication is a copy of its stretc
 They are written to `<outprefix>.background_sv.vcf` (a duplication's record sits at the end of the copied
 stretch, with `INFO/DUPSTART` at its start), never to the TE truth, and `Evaluate --background_sv` counts
 the calls a caller made at them, by type and size.
+
+**Nested insertions.** An insertion may land in sequence that other events change:
+
+- inside a reference element a deletion, excision or non-mobilizing SV takes in some genomes
+  (TErandom places such insertions freely; only the reference events' breakpoints keep clear), or
+- inside another insertion's element (`TErandom --nNested N`: N of the insertions go into others,
+  each into a parent of its own chosen in proportion to its length, written at the parent's position
+  with `HOST=<position>:<offset>` in the BED's 7th column).
+
+Every event draws its carriers alone, and Simulate then takes a nested insertion away from each
+genome that lacks its host sequence: one that carries the host's deletion or non-mobilizing SV, or
+its excision unless the insertion lies in the 5' LTR the excision leaves, or, for a child, one that
+lacks the parent. So a nested insertion's genotypes with its host are its genotypes without it, less
+the genomes the host takes the site from. In the truth VCF it keeps its own record, with
+`INFO/HOST=CHROM:POS:ID` naming the host and GT `.` in the genomes with no site (0 means the host
+sequence is there without the insertion). A child's ALT is its parent's whole allele with the child
+inside, so it reads the same sequence a carrier holds. `Evaluate` leaves a `.` genome out of the
+nested locus (the host's locus scores it), counts an allele that is the host with an insertion inside
+as carrying the host, and lets a child be called as another ALT of its parent's record.
 
 **Per-element TSD.** TSD length is a property of the clade, not a constant: a cut-and-paste
 transposon's TSD is set by the stagger between its transposase's two cuts, so hAT and P

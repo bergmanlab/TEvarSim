@@ -81,9 +81,12 @@ def test_nonmobilizing_svs():
             else:
                 assert kind == "wide" and hs - 5000 <= s <= hs - 250 and he + 250 <= e <= he + 5000, r
         assert kinds == {k: 3 for k in ("internal", "left", "right", "tight", "wide")}, kinds
-        spans = sorted((int(r[1]), int(r[2])) for r in rows)
-        assert all(a[1] < b[0] or (a[0] == a[1] and a[1] <= b[0]) for a, b in zip(spans, spans[1:])), \
-            "events overlap"
+        # Spans never overlap one another; an insertion may lie inside one (nested), not on its ends.
+        spans = sorted((int(r[1]), int(r[2])) for r in rows if int(r[2]) > int(r[1]))
+        assert all(a[1] < b[0] for a, b in zip(spans, spans[1:])), "events overlap"
+        points = [int(r[1]) for r in rows if int(r[2]) == int(r[1])]
+        assert not any(s - 500 <= p < s + 500 or e - 500 <= p < e + 500 for s, e in spans for p in points), \
+            "an insertion sits on a breakpoint"
 
         # --regions says where insertions go, not the SVs; --exclude keeps both out.
         regions, exclude = os.path.join(d, "regions.bed"), os.path.join(d, "exclude.bed")
