@@ -351,11 +351,14 @@ def link_hosts(events):
 
     A host absent from the file -- a non-mobilizing SV, which has a VCF of its own, or a
     deletion no genome carried -- leaves the insertion unlinked: it is scored as any other.
+    HOST names the nearest record before this one with that key: a child may share its parent's
+    position and ID (a jockey into a jockey), and Simulate writes it after the parent.
     '''
-    by_key = {f"{e.chrom}:{e.pos}:{e.id}": e for e in events}
-    for e in events:
-        host = by_key.get(e.info.get("HOST")) if e.info.get("HOST") else None
-        if host is not None and host is not e:
+    last_with_key = {}
+    for e in sorted(events, key=lambda e: e.index):
+        host = last_with_key.get(e.info.get("HOST")) if e.info.get("HOST") else None
+        last_with_key[f"{e.chrom}:{e.pos}:{e.id}"] = e
+        if host is not None:
             e.host = host
             host.nested.append(e)
 

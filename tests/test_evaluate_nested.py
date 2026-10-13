@@ -54,6 +54,24 @@ def test_an_insertion_into_an_insertion_called_as_a_second_alt():
         assert c["alleles"]["noncarrier"]["total"] == 1      # S0, which has the parent but not the child
 
 
+def test_a_child_with_its_parents_id_still_finds_its_parent():
+    """HOST names the nearest record before it with that CHROM:POS:ID, so a jockey inside a
+    jockey at one position links to the parent, not to itself."""
+    parent = te.ANCHOR + te.ELEMENT
+    k = 100
+    child = te.ANCHOR + te.ELEMENT[:k] + te.ELEMENT[:300] + te.ELEMENT[k:]
+    truth = [(1000, "jockey#LINE/Jockey_", te.ANCHOR, [parent], "TYPE=INS;EVENTTYPE=INS", ["1", "1", "0"]),
+             (1000, "jockey#LINE/Jockey_", te.ANCHOR, [child],
+              "TYPE=INS;EVENTTYPE=INS;HOST=chrT:1000:jockey#LINE/Jockey_", ["0", "1", "."])]
+    pred = [(1000, "call.1", te.ANCHOR, [parent, child], ".", ["1", "2", "0"])]
+    with tempfile.TemporaryDirectory() as d:
+        loci = _evaluate(d, truth, pred).loci
+        p, c = loci
+        assert p["host"] is None and c["host"] == "jockey#LINE/Jockey_", (p["host"], c["host"])
+        assert c["no_site"] == ["S2"] and (c["carriers"]["tp"], c["carriers"]["fp"]) == (1, 0), c["carriers"]
+        assert (p["carriers"]["tp"], p["carriers"]["fn"]) == (2, 0), p["carriers"]
+
+
 def test_a_genome_without_the_host_has_no_site_at_the_nested_locus():
     host_ref = te.ANCHOR + te.ELEMENT * 3
     truth = [(1000, "DEL-chrT-1000-1600-LTR/Copia-TY1", host_ref, [te.ANCHOR], "TYPE=DEL;EVENTTYPE=DEL",
