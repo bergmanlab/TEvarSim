@@ -176,6 +176,10 @@ allele frequency, carriers and TSD from streams seeded by `--seed` and the event
 event also has the same carriers and TSD in every run. `--nMIN` deletions are the exception: they
 are not nested across deletion counts.
 
+The layers can also be split across runs: insertions in one or more TErandom passes, then the
+reference events in a pass of their own with `--nINS 0 --placedTEs <the insertions' BED>`, which
+keeps clear of those insertions exactly as one pass keeps clear of its own and draws the same events.
+
 ### 2. TEreal
 Automatically generate pTE positions from RepeatMasker or UCSC repeat annotations.
 

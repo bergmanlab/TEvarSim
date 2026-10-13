@@ -190,6 +190,14 @@ class RandomTE:
         self.out_fasta = args.outprefix + ".bgSV.fa"
         self.DELfile = args.existingTEs
         self.EXCfile = getattr(args, "excCandidates", None)
+        # Insertions an earlier pass placed: kept clear of like this pass's own (see clear_of).
+        self.placed = []
+        if getattr(args, "placedTEs", None):
+            with open(args.placedTEs) as fin:
+                for line in fin:
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) >= 3 and not line.startswith("#"):
+                        self.placed.append((fields[0], int(fields[1]), int(fields[2])))
         self.sense_strand_ratio = args.sense_strand_ratio
         self.CHR = {}
         if not os.path.isfile(f"{args.ref}.fai"):
@@ -309,8 +317,9 @@ class RandomTE:
         # 2. parse DEL file (populates self.DEL, and self.EXC candidates for RepeatMasker input),
         #    and drop every candidate an insertion landed in or beside
         self.parse_DEL()
-        self.DEL = self.clear_of(self.DEL, self.INS)
-        self.EXC = self.clear_of(self.EXC, self.INS)
+        placed = [(i[0], i[1], i[2]) for i in self.INS] + self.placed
+        self.DEL = self.clear_of(self.DEL, placed)
+        self.EXC = self.clear_of(self.EXC, placed)
         nm_hosts = list(self.DEL)    # select_NM passes over those a deletion or excision took
         # 3. select deletions
         if self.nDEL > len(self.DEL):
@@ -344,14 +353,15 @@ class RandomTE:
             logging.info(f"Generated BED file and fasta file with background SVs are: {bedout} and {self.out_fasta}")
 
     def clear_of(self, candidates, insertions):
-        """The candidates no insertion lies in or within --TEdistance of: the buffer insertions
-        keep from each other, and the one they kept from deletions when they were placed last."""
-        points = {}
-        for chrom, pos, *_ in insertions:
-            points.setdefault(chrom, []).append(pos)
+        """The candidates no insertion (chrom, start, end) lies in or within --TEdistance of: the
+        buffer insertions keep from each other, and the one they kept from deletions when they were
+        placed last."""
+        spans = {}
+        for chrom, start, end in insertions:
+            spans.setdefault(chrom, []).append((start, end))
         d = self.TEdistance
         return [c for c in candidates
-                if not any(c[1] - d <= p < c[2] + d for p in points.get(c[0], ()))]
+                if not any(c[1] - d <= e and s < c[2] + d for s, e in spans.get(c[0], ()))]
 
     def select_EXC(self):
         """Pick nEXC full-length LTR elements to excise from those no deletion took."""
@@ -401,7 +411,8 @@ class RandomTE:
             return
         rnd = random.Random(None if self.random_seed is None else self.random_seed + 4241)
         taken = sorted([(d[0], d[1], d[2]) for d in self.DEL + self.EXC] +
-                       [(i[0], i[1] - self.TEdistance, i[1] + self.TEdistance) for i in self.INS])
+                       [(i[0], i[1] - self.TEdistance, i[2] + self.TEdistance)
+                        for i in [(x[0], x[1], x[2]) for x in self.INS] + self.placed])
         taken_by_chrom = {}
         for c, s, e in taken:
             taken_by_chrom.setdefault(c, []).append((s, e))

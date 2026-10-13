@@ -95,6 +95,10 @@ def main():
                     help="BED of full-length LTR elements eligible for excision: chrom, start, end (the element alone, "
                          "no TSD), name#class/family, score, strand, and the 5' LTR length in a 7th column. A deletion "
                          "candidate overlapping an element chosen for excision is not deleted as well")
+    TErandom_parser.add_argument("--placedTEs", type=Existing_File_Path, default=None,
+                    help="BED of insertions an earlier TErandom pass placed (chrom, start, end, ...). This pass's "
+                         "deletions, excisions and non-mobilizing SVs keep clear of them as of its own insertions, "
+                         "so a run can place its insertions in several passes and its reference events in one after")
     TErandom_parser.add_argument("--nNM", type=int, default=0,
                     help="Number of non-mobilizing SVs: deletions that cut into or swallow an --existingTEs element "
                          "but are no TE mechanism, so a TE caller should call none of them. Their hosts are elements "

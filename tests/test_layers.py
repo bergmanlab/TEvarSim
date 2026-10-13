@@ -77,6 +77,22 @@ def test_insertions_are_the_same_whatever_else_is_asked_for():
             assert got == base, (kw, got, base)
 
 
+def test_reference_events_in_a_pass_of_their_own_match_one_pass():
+    """Insertions in one pass and the reference events in a second (--nINS 0 --placedTEs) give
+    exactly the events one pass makes: the way a run with several insertion passes works."""
+    with tempfile.TemporaryDirectory() as d:
+        _, one = _pool(d, "one", n_del=5, n_exc=3, n_nm=4)
+        ins_out, ins_rows = _pool(d, "ins")
+        ref, lib, dels, excs = _fixture(d)
+        out = os.path.join(d, "ref_events")
+        _tevarsim("TErandom", "--ref", ref, "--consensus", lib, "--existingTEs", dels,
+                  "--excCandidates", excs, "--nINS", 0, "--nDEL", 5, "--nEXC", 3, "--nNM", 4,
+                  "--placedTEs", ins_out + ".bed", "--seed", 7, "--outprefix", out)
+        two = sorted(ins_rows + [l.rstrip("\n").split("\t") for l in open(out + ".bed")],
+                     key=lambda r: (r[0], int(r[1]), int(r[2])))
+        assert two == one, (two, one)
+
+
 def test_strand_targets_do_not_tie_the_insertions_to_the_deletions():
     with tempfile.TemporaryDirectory() as d:
         ratio = ("--sense-strand-ratio", 0.7)
