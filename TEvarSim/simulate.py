@@ -177,12 +177,10 @@ class Simulator:
         # A bed whose contigs are interleaved is still accepted, so long as each contig's own
         # events ascend and none of them overlap.
         #
-        # Two kinds of overlap are allowed, both of an insertion with the sequence it landed in:
-        # an insertion strictly inside a deletion, excision or non-mobilizing SV (a reference
-        # element, or the span a non-mobilizing SV takes) is NESTED in it, and an insertion with
-        # HOST=<pos>:<offset> in the BED's 7th column is the CHILD of the insertion at that
-        # position, inside its inserted sequence. A genome without the host sequence cannot carry
-        # what was inserted into it; _mask_nested sorts that out once genotypes are drawn.
+        # One overlap is allowed: an insertion strictly inside a deletion, excision or
+        # non-mobilizing SV (a reference element, or the span a non-mobilizing SV takes) is NESTED
+        # in it. A genome without the host sequence cannot carry what was inserted into it;
+        # _mask_nested sorts that out once genotypes are drawn.
         previous = {}
         for event in self.TEevents:
             chrom = event["chrom"]
@@ -194,19 +192,7 @@ class Simulator:
                 raise ValueError(f"Contig not found in reference: {chrom}")
             if start < 0 or end > self.CHR[chrom]["len"]:
                 raise ValueError(f"TE event out of genome bounds. Position: {chrom}\t{start}\t{end}")
-            prev_start, prev_end, host, last_ins = previous.get(chrom, (-1, -1, None, None))
-            if event.get("host_pos") is not None:
-                if (last_ins is None or last_ins["start"] != event["host_pos"]
-                        or last_ins.get("parent") is not None or last_ins.get("child") is not None):
-                    raise ValueError(
-                        f"HOST={event['host_pos']}:{event['host_offset']} at {chrom}\t{start} names no "
-                        f"insertion just before it: a child follows its parent, one child per parent, "
-                        f"and a child is never a parent")
-                event["parent"] = last_ins
-                last_ins["child"] = event
-                event["host"] = last_ins.get("host")
-                self.CHR[chrom]["events"].append(event)
-                continue
+            prev_start, prev_end, host = previous.get(chrom, (-1, -1, None))
             # Unsorted is diagnosed before overlapping because it is the more likely cause and
             # the more useful thing to be told: an out-of-order event always overlaps the one
             # before it as well, so the overlap message alone would point at a symptom.
@@ -227,9 +213,7 @@ class Simulator:
                 host = event
             else:
                 host = None
-            if event["type"] == "INS":
-                last_ins = event
-            previous[chrom] = (start, max(end, prev_end), host, last_ins)
+            previous[chrom] = (start, max(end, prev_end), host)
             self.CHR[chrom]["events"].append(event)
 
     def _parse_bed(self):
@@ -263,11 +247,6 @@ class Simulator:
                 else:
                     # A non-mobilizing SV (TErandom --nNM) is a deletion of whatever span it names.
                     event_type = "INS" if end-start <= 1 and not te_id.startswith("NM-") else "DEL"
-                # An insertion into another insertion's sequence (TErandom --nNested): 7th column
-                # HOST=<the parent's position>:<offset into its inserted sequence>.
-                host_pos = host_offset = None
-                if len(line) > 6 and line[6].startswith("HOST="):
-                    host_pos, host_offset = map(int, line[6][5:].split(":"))
                 self.TEevents.append({
                     "chrom":chrom,
                     "start": start,
@@ -280,8 +259,6 @@ class Simulator:
                     "background": te_id.startswith("bg"),
                     # TErandom --nNM: in the genomes, in <prefix>.nonmobilizing.vcf, never TE truth.
                     "nonmobilizing": te_id.startswith("NM-"),
-                    "host_pos": host_pos,
-                    "host_offset": host_offset,
                 })
         print(f"[INFO] Parsed {len(self.TEevents)} TE events from BED.",file=sys.stderr)
         print(f"[INFO] Example event: {self.TEevents[0] if self.TEevents else 'No events'}",file=sys.stderr)
@@ -356,16 +333,14 @@ class Simulator:
         whatever its host does, and a run with the host's deletion differs from one without it only
         where it has to. A genome lacks the insertion's site when it carries the host's deletion or
         non-mobilizing SV, or its excision -- unless the insertion lies in the 5' LTR the excision
-        leaves -- or, for a child, when it lacks the parent insertion. Those genomes are recorded
+        leaves. Those genomes are recorded
         as having no site at all (event["applicable"]), which the truth VCF writes as ".", not as
         "does not carry". Events come in file order, so a host's row is final before its nested
         insertions are read against it.
         """
         row_of = {id(e): i for i, e in enumerate(events)}
         for i, e in enumerate(events):
-            if e.get("parent") is not None:
-                site = genotypes[row_of[id(e["parent"])]].astype(bool)
-            elif e.get("host") is not None:
+            if e.get("host") is not None:
                 h = e["host"]
                 carried = genotypes[row_of[id(h)]].astype(bool)
                 site = ~carried
@@ -394,7 +369,7 @@ class Simulator:
         empty = np.flatnonzero(genotypes.sum(axis=1) == 0)
         rescued = 0
         for row in empty:
-            is_nested = events[row].get("host") is not None or events[row].get("parent") is not None
+            is_nested = events[row].get("host") is not None
             if nested is not None and is_nested != nested:
                 continue
             # Only a genome with the site can carry it; a nested insertion none has stays empty.
@@ -491,29 +466,7 @@ class Simulator:
                 else:
                     lo, hi = self._clamp_tsd(bounds)
             tsd_len = lo if lo == hi else int(self._event_rng(event, self._TSD).integers(lo, hi + 1))
-            if event.get("parent") is not None:
-                # An insertion into an insertion: the parent's allele with this element inside its
-                # inserted sequence, offset bases in, duplicating the parent's bases just 5' of the
-                # cut. The ALT is the whole allele a carrier has at the parent's anchor, so a genome
-                # that carries both reads the same sequence from either record.
-                parent = event["parent"]
-                inserted = parent["alt"][1:]            # the parent element, oriented, and its TSD
-                element_len = len(inserted) - parent["tsd_len"]
-                k = event["host_offset"]
-                if not 0 < k < element_len:
-                    raise ValueError(f"HOST offset {k} at {chrom}\t{start} is not inside the parent "
-                                     f"element ({element_len} bp)")
-                try:
-                    te_seq = te_pool[te_id]
-                except KeyError:
-                    raise ValueError(f"TE sequence {te_id} not found in {self.pool_fasta}")
-                if strand == "-":
-                    te_seq = te_seq.reverse_complement()
-                child_insert = str(te_seq) + inserted[max(0, k - tsd_len):k]
-                event["child_insert"] = child_insert
-                ref_allele = parent["ref"]
-                alt_allele = parent["alt"][0] + inserted[:k] + child_insert + inserted[k:]
-            elif event["type"] == "INS":
+            if event["type"] == "INS":
                 # bed file is 0-based
                 ref_allele = self.CHR[chrom]["seq"][start - 1]
                 try:
@@ -871,7 +824,7 @@ class Simulator:
             vcf.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Net length change of the variant, negative for excision (EXC only)">\n')
             vcf.write('##INFO=<ID=TSD,Number=1,Type=Integer,Description="Target site duplication length: for an insertion the ALT allele ends with the TSD bases immediately 5\' of POS. Meaningless for DEL and EXC, which duplicate nothing">\n')
             vcf.write('##INFO=<ID=TEFAMILY,Number=1,Type=String,Description="TE family ID from consensus">\n')
-            vcf.write('##INFO=<ID=HOST,Number=1,Type=String,Description="The event this insertion landed in, as CHROM:POS:ID: a reference event (DEL, EXC, or a non-mobilizing SV in the .nonmobilizing.vcf) whose span holds POS, or the insertion at the same POS into whose inserted sequence it went, in which case ALT is that whole allele with this element inside. GT is . in a genome without the host sequence (no site to carry), 0 in one with the host sequence but not this insertion">\n')
+            vcf.write('##INFO=<ID=HOST,Number=1,Type=String,Description="The event this insertion landed in, as CHROM:POS:ID: a reference event (DEL, EXC, or a non-mobilizing SV in the .nonmobilizing.vcf) whose span holds POS. GT is . in a genome without the host sequence (no site to carry), 0 in one with the host sequence but not this insertion">\n')
             vcf.write('##INFO=<ID=SNP,Number=1,Type=Integer,Description="Number of SNP modifications in TE sequence">\n')
             vcf.write('##INFO=<ID=INDEL,Number=1,Type=Integer,Description="Number of INDEL modifications in TE sequence">\n')
             vcf.write('##INFO=<ID=polyA,Number=1,Type=Integer,Description="Length of added polyA tail in TE sequence">\n')
@@ -922,7 +875,7 @@ class Simulator:
                     elif event_type == "EXC":
                         info_parts.append(f"LTRLEN={event['ltr_len']}")
                         info_parts.append(f"SVLEN={len(alt) - len(ref)}")
-                    host = event.get("parent") or event.get("host")
+                    host = event.get("host")
                     if host is not None:
                         info_parts.append(f"HOST={host['chrom']}:{host['start']}:{host['te_id']}")
 
@@ -967,7 +920,7 @@ class Simulator:
         sequence, which --diverse mutates.
 
         Walking the events in order, each top-level event contributes its alleles' chunks: an
-        insertion its sequence (split around a child's, which only the child's carriers hold), a
+        insertion its sequence, a
         deletion or non-mobilizing SV its span (held by the genomes that do not carry it), an
         excision the full element and the solo LTR, a background SNP its two bases. An insertion
         nested in a reference event splits that event's span at its point, in each allele that
@@ -979,8 +932,6 @@ class Simulator:
         rows = {id(e): genotypes[i].astype(bool) for i, e in enumerate(events)}
         nested_in, tops = {}, []
         for e in events:
-            if e.get("parent") is not None:
-                continue                        # reached through its parent
             if e.get("host") is not None:
                 nested_in.setdefault(id(e["host"]), []).append(e)
             else:
@@ -991,17 +942,7 @@ class Simulator:
             return a if b is None else a & b
 
         def emit_ins(e, cond):
-            held = both(rows[id(e)], cond)
-            te = not e.get("background")
-            child = e.get("child")
-            inserted = e["alt"][1:]
-            if child is None:
-                chunks.append((inserted, held, te))
-                return
-            k = child["host_offset"]
-            chunks.append((inserted[:k], held, te))
-            chunks.append((child["child_insert"], both(rows[id(child)], cond), True))
-            chunks.append((inserted[k:], held, te))
+            chunks.append((e["alt"][1:], both(rows[id(e)], cond), not e.get("background")))
 
         def emit_span(lo, hi, held, inner, te):
             cur = lo

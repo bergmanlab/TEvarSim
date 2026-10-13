@@ -1,7 +1,6 @@
 """
-Insertions that land in other events' sequence: inside a reference element a deletion,
-excision or non-mobilizing SV takes in some genomes (NESTED), or inside another insertion's
-inserted sequence (a CHILD, BED 7th column HOST=<parent pos>:<offset>).
+Insertions that land inside a reference element a deletion, excision or non-mobilizing SV takes
+in some genomes (NESTED).
 
 Each draws its carriers alone, and a genome without the host sequence loses it and has no site
 for it at all: GT "." in the truth, not 0. These tests build small populations and check the
@@ -33,7 +32,7 @@ def _seq(n, seed):
 
 REF = _seq(4000, 1)
 ELEM = _seq(300, 2)        # the pool element every insertion uses
-CHILD = _seq(120, 3)       # a second family, for children
+CHILD = _seq(120, 3)       # a second family
 N = 12
 
 
@@ -121,30 +120,6 @@ def test_insertion_in_an_excised_element_survives_only_in_the_solo_ltr():
         assert any(c[0] == "1" and c[1] == "1" for c in cases), cases
 
 
-def test_insertion_into_an_insertion():
-    rows = [("chrA", 2000, 2000, "elem#LTR/Copia", ".", "+"),
-            ("chrA", 2000, 2000, "kid#LINE/L1", ".", "-", "HOST=2000:120")]
-    with tempfile.TemporaryDirectory() as d:
-        recs, genomes = _run(d, rows, seed=3)
-        parent, child = _by_id(recs)["elem#LTR/Copia"], _by_id(recs)["kid#LINE/L1"]
-        assert _info(child)["HOST"] == "chrA:2000:elem#LTR/Copia"
-        p_ins = ELEM + REF[1995:2000]
-        kid = CHILD.translate(str.maketrans("ACGT", "TGCA"))[::-1]
-        c_ins = p_ins[:120] + kid + p_ins[113:120] + p_ins[120:]
-        assert child[4] == REF[1999] + c_ins, "the child's ALT is the whole allele"
-        cases = set()
-        for g in range(N):
-            p, c = parent[9 + g], child[9 + g]
-            cases.add((p, c))
-            if p == "0":
-                assert c == "." and genomes[g] == REF
-            elif c == "1":
-                assert genomes[g] == REF[:2000] + c_ins + REF[2000:]
-            else:
-                assert genomes[g] == REF[:2000] + p_ins + REF[2000:]
-        assert {("0", "."), ("1", "1"), ("1", "0")} <= cases, cases
-
-
 def test_a_host_changes_only_the_genomes_it_has_to():
     """Draw, then mask: the nested insertion's carriers with the host's deletion are its carriers
     without it, less the genomes the deletion takes the site from."""
@@ -155,19 +130,6 @@ def test_a_host_changes_only_the_genomes_it_has_to():
         a, h = _by_id(alone)["elem#LTR/Copia"], _by_id(hosted)["elem#LTR/Copia"]
         assert all(hg == ag for ag, hg in zip(a[9:], h[9:]) if hg != ".")
         assert "." in h[9:]
-
-
-def test_one_child_per_parent():
-    rows = [("chrA", 2000, 2000, "elem#LTR/Copia", ".", "+"),
-            ("chrA", 2000, 2000, "kid#LINE/L1", ".", "+", "HOST=2000:50"),
-            ("chrA", 2000, 2000, "kid#LINE/L1", ".", "+", "HOST=2000:90")]
-    with tempfile.TemporaryDirectory() as d:
-        try:
-            _run(d, rows)
-        except ValueError as exc:
-            assert "one child per parent" in str(exc)
-            return
-    raise AssertionError("a second child was accepted")
 
 
 if __name__ == "__main__":

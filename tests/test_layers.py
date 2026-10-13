@@ -167,35 +167,10 @@ def test_simulate_gives_a_shared_insertion_the_same_carriers_and_tsd():
         assert set(mixed) <= set(alone), "no insertion should appear that a run without them lacks"
 
 
-def test_nested_insertions_go_into_others():
-    with tempfile.TemporaryDirectory() as d:
-        _, flat = _pool(d, "flat")
-        _, three = _pool(d, "three", extra=("--nNested", 3))
-        _, five = _pool(d, "five", extra=("--nNested", 5))
-        def kids(rows):
-            return [r for r in rows if len(r) > 6 and r[6].startswith("HOST=")]
-        k3, k5 = kids(three), kids(five)
-        assert len(k3) == 3 and len(k5) == 5
-        for rows in (three, five):
-            ins = [r for r in rows if r not in kids(rows)]
-            for i, r in enumerate(rows):
-                if r in kids(rows):
-                    pos, off = map(int, r[6][5:].split(":"))
-                    parent = rows[i - 1]
-                    assert int(r[1]) == pos == int(parent[1]) and parent not in kids(rows), (r, parent)
-                    assert 0 < off
-            parents = [rows[i - 1][1] for i, r in enumerate(rows) if r in kids(rows)]
-            assert len(set(parents)) == len(parents), "one child per parent"
-        # Every insertion that is not a child is where the flat run put it.
-        flat_ins = {tuple(r[:2]) for r in flat}
-        assert all(tuple(r[:2]) in flat_ins for r in five)
-        assert len(five) == len(three) == len(flat)
-
-
 def test_simulate_takes_a_nested_pool():
     with tempfile.TemporaryDirectory() as d:
         ref = _fixture(d)[0]
-        out, _ = _pool(d, "n", n_del=5, n_exc=3, extra=("--nNested", 4))
+        out, _ = _pool(d, "n", n_del=10, n_exc=5, extra=("--nINS", 100))
         _tevarsim("Simulate", "--ref", ref, "--bed", out + ".bed", "--pool", out + ".fa", "--num", 10,
                   "--af-min", 0.5, "--af-max", 0.5, "--allow-zero-carriers", "--tsd-from-header",
                   "--seed", 7, "-O", out + "_sim")

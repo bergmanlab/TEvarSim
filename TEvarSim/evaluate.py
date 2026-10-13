@@ -351,26 +351,13 @@ def link_hosts(events):
 
     A host absent from the file -- a non-mobilizing SV, which has a VCF of its own, or a
     deletion no genome carried -- leaves the insertion unlinked: it is scored as any other.
-    HOST names the nearest record before this one with that key: a child may share its parent's
-    position and ID (a jockey into a jockey), and Simulate writes it after the parent.
     '''
-    last_with_key = {}
-    for e in sorted(events, key=lambda e: e.index):
-        host = last_with_key.get(e.info.get("HOST")) if e.info.get("HOST") else None
-        last_with_key[f"{e.chrom}:{e.pos}:{e.id}"] = e
-        if host is not None:
+    by_key = {f"{e.chrom}:{e.pos}:{e.id}": e for e in events}
+    for e in events:
+        host = by_key.get(e.info.get("HOST")) if e.info.get("HOST") else None
+        if host is not None and host is not e:
             e.host = host
             host.nested.append(e)
-
-
-def descendants(event):
-    '''Every truth locus nested in this one, at any depth.'''
-    out, stack = [], list(event.nested)
-    while stack:
-        e = stack.pop()
-        out.append(e)
-        stack.extend(e.nested)
-    return out
 
 
 # A carrier-info value marking less than this fraction of the REF value's annotated bp is a remnant of the REF element
@@ -643,13 +630,8 @@ def carries_event(event, neighbours, tsample, p_descs):
     if not sizes or any(d.symbolic for d in p_descs if d.idx != 0) or \
             any(t.symbolic or t.size is None for t in event.alt_descs) or not event.alt_descs:
         return True                 # nothing comparable by length: every non-reference allele counts, as before
-    # An insertion nested in this event is carried only with it: an allele that is this event with
-    # an insertion inside is this event's as well, and a nested insertion is no rival for it.
-    inner = descendants(event)
-    own = list(event.alt_descs) + [t for n in inner for t in n.alt_descs if not t.symbolic and t.size]
-    neighbours = [n for n in neighbours if not any(n is i for i in inner)]
     for size in sizes:
-        sized = [t.size for t in own
+        sized = [t.size for t in event.alt_descs
                  if t.size and (size > 0) == (t.size > 0)
                  and abs(size - t.size) <= EVENT_ALT_LENGTH_FRACTION * abs(t.size)]
         if not sized:
@@ -774,17 +756,6 @@ def match_events(events, records, max_dist, tol):
         # from a prediction back to the locus that claimed it as well as the other way.
         by_chrom[chrom][j].matched_for = events[i]
     match_displaced(events, by_chrom, taken_events, taken_records, max_dist, tol)
-    # A nested insertion may share its host's record: a caller writing an element and the same
-    # element with an insertion inside as two ALTs of one record has called both. Only where that
-    # record has an allele agreeing with the nested insertion, and within --max_dist of it.
-    for event in events:
-        host = event.host
-        if event.match is not None or host is None or host.match is None:
-            continue
-        record = host.match
-        if abs(pred_offset(record, event.pos)) <= max_dist and \
-                alleles_overlap(event.alt_descs, record.alt_descs, tol):
-            event.match = record
 
 
 def ltr_shift(event):

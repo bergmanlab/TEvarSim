@@ -95,11 +95,6 @@ def main():
                     help="BED of full-length LTR elements eligible for excision: chrom, start, end (the element alone, "
                          "no TSD), name#class/family, score, strand, and the 5' LTR length in a 7th column. A deletion "
                          "candidate overlapping an element chosen for excision is not deleted as well")
-    TErandom_parser.add_argument("--nNested", type=int, default=0,
-                    help="Number of the --nINS insertions placed inside another insertion's sequence rather than "
-                         "the reference: each into a parent of its own, chosen in proportion to its length, written "
-                         "at the parent's position with HOST=<position>:<offset> in the BED's 7th column. Simulate "
-                         "gives a child only to genomes that carry its parent (default: 0)")
     TErandom_parser.add_argument("--placedTEs", type=Existing_File_Path, default=None,
                     help="BED of insertions an earlier TErandom pass placed (chrom, start, end, ...). This pass's "
                          "deletions, excisions and non-mobilizing SVs keep clear of them as of its own insertions, "

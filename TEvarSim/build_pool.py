@@ -261,7 +261,6 @@ class RandomTE:
 
         self.nINS = args.nINS
         self.nDEL = args.nDEL
-        self.nNested = getattr(args, "nNested", 0) or 0
         self.nEXC = args.nEXC  # number of LTR-LTR recombinations (excisions)
         self.TEtype = TEtype(args.TEtype)
         self.prefix = args.outprefix
@@ -480,15 +479,14 @@ class RandomTE:
     def build_bed(self):
         # merge INS, DEL, EXC and NM
         merged = self.INS + self.DEL + self.EXC + self.NM
-        # A child shares its parent's position and comes after it.
-        merged.sort(key=lambda t: (t[0], t[1], t[2], len(t) > 7 and str(t[7]).startswith("HOST="), t[3]))
+        merged.sort()
         # bedfile output
         bed_name = self.prefix + ".bed"
         check_output_file(bed_name)
         with open(bed_name, "w") as f:
             for chrom, start, end, teID, _cls, _typ, strand, *rest in merged:
                 cols = [chrom, str(start), str(end), teID, ".", strand]
-                if rest:  # EXC records carry the LTR length as a 7th column, children HOST=
+                if rest:  # EXC records carry the LTR length as a 7th column
                     cols.append(str(rest[0]))
                 f.write("\t".join(cols) + "\n")
         logging.info(f"Generated BED file: {bed_name}")
@@ -668,33 +666,6 @@ class RandomTE:
                               target_strands=self.ins_strands, rng=self.ins_rng)
         for record, (chrom, pos, strand) in zip(records,INSpos):
             self.INS.append((chrom, pos, pos, record.id, record.id.split("/")[1], "INS", strand))
-        self.nest_insertions(records)
-
-    def nest_insertions(self, records):
-        """Move --nNested of the insertions into others' inserted sequence. The children are the
-        first of the insertions in a fixed shuffled order (so more nested keeps the children fewer
-        made, though not necessarily their parents), each into a parent of
-        its own, chosen in proportion to its element's length, at an offset uniform inside it. A
-        child keeps the reference position it drew, unused, so the other insertions are where a run
-        without nesting would put them; it is written at its parent's position with
-        HOST=<parent position>:<offset> in the 7th column, and never hosts one itself."""
-        if not self.nNested:
-            return
-        if 2 * self.nNested > len(self.INS):
-            raise ValueError(f"--nNested {self.nNested} needs at least {2 * self.nNested} insertions, "
-                             f"one parent per child; there are {len(self.INS)}")
-        rng = layer_rng(self.random_seed, LAYER_INS, 2)
-        order = rng.permutation(len(self.INS))
-        children, parents = order[:self.nNested], order[self.nNested:]
-        lengths = np.array([len(records[i].seq) for i in parents], dtype=float)
-        chosen = rng.choice(len(parents), size=self.nNested, replace=False, p=lengths / lengths.sum())
-        for c, j in zip(children, chosen):
-            p = parents[j]
-            chrom, pos = self.INS[p][0], self.INS[p][1]
-            offset = int(rng.integers(1, len(records[p].seq)))
-            _, _, _, te_id, fam, typ, strand = self.INS[c]
-            self.INS[c] = (chrom, pos, pos, te_id, fam, typ, strand, f"HOST={pos}:{offset}")
-        logging.info(f"Nested {self.nNested} insertion(s) inside others")
 
 class TEPoolBuilder:
     def __init__(self, args):

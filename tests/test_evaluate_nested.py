@@ -1,7 +1,6 @@
 """
 Evaluate on a truth with nested insertions (Simulate's INFO/HOST): a genome without the host
-sequence (GT ".") has no site and is scored only at the host's locus, and an insertion into an
-insertion may be called as a second ALT of its parent's record.
+sequence (GT ".") has no site and is scored only at the host's locus.
 
     PYTHONPATH=. python tests/test_evaluate_nested.py
 """
@@ -33,43 +32,6 @@ def _evaluate(d, truth_records, pred_records):
 
 def _scored(ev):
     return {s["id"]: s for s in ev.loci}
-
-
-def test_an_insertion_into_an_insertion_called_as_a_second_alt():
-    parent = te.ANCHOR + te.ELEMENT
-    k = len(te.ELEMENT) // 2
-    child = te.ANCHOR + te.ELEMENT[:k] + KID + te.ELEMENT[k:]
-    truth = [(1000, "TY1-FULL#LTR/Copia_", te.ANCHOR, [parent], "TYPE=INS;EVENTTYPE=INS", ["1", "1", "0"]),
-             (1000, "kid#LINE/L1_", te.ANCHOR, [child],
-              "TYPE=INS;EVENTTYPE=INS;HOST=chrT:1000:TY1-FULL#LTR/Copia_", ["0", "1", "."])]
-    pred = [(1000, "call.1", te.ANCHOR, [parent, child], ".", ["1", "2", "0"])]
-    with tempfile.TemporaryDirectory() as d:
-        ev = _evaluate(d, truth, pred)
-        s = _scored(ev)
-        p, c = s["TY1-FULL#LTR/Copia_"], s["kid#LINE/L1_"]
-        assert p["detected"] and c["detected"], (p["match"], c["match"])
-        assert (p["carriers"]["tp"], p["carriers"]["fp"], p["carriers"]["fn"]) == (2, 0, 0), p["carriers"]
-        assert (c["carriers"]["tp"], c["carriers"]["fp"], c["carriers"]["fn"]) == (1, 0, 0), c["carriers"]
-        assert c["host"] == "TY1-FULL#LTR/Copia_" and c["no_site"] == ["S2"], c
-        assert c["alleles"]["noncarrier"]["total"] == 1      # S0, which has the parent but not the child
-
-
-def test_a_child_with_its_parents_id_still_finds_its_parent():
-    """HOST names the nearest record before it with that CHROM:POS:ID, so a jockey inside a
-    jockey at one position links to the parent, not to itself."""
-    parent = te.ANCHOR + te.ELEMENT
-    k = 100
-    child = te.ANCHOR + te.ELEMENT[:k] + te.ELEMENT[:300] + te.ELEMENT[k:]
-    truth = [(1000, "jockey#LINE/Jockey_", te.ANCHOR, [parent], "TYPE=INS;EVENTTYPE=INS", ["1", "1", "0"]),
-             (1000, "jockey#LINE/Jockey_", te.ANCHOR, [child],
-              "TYPE=INS;EVENTTYPE=INS;HOST=chrT:1000:jockey#LINE/Jockey_", ["0", "1", "."])]
-    pred = [(1000, "call.1", te.ANCHOR, [parent, child], ".", ["1", "2", "0"])]
-    with tempfile.TemporaryDirectory() as d:
-        loci = _evaluate(d, truth, pred).loci
-        p, c = loci
-        assert p["host"] is None and c["host"] == "jockey#LINE/Jockey_", (p["host"], c["host"])
-        assert c["no_site"] == ["S2"] and (c["carriers"]["tp"], c["carriers"]["fp"]) == (1, 0), c["carriers"]
-        assert (p["carriers"]["tp"], p["carriers"]["fn"]) == (2, 0), p["carriers"]
 
 
 def test_a_genome_without_the_host_has_no_site_at_the_nested_locus():
