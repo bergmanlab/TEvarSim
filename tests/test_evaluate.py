@@ -857,7 +857,8 @@ def test_a_missed_locus_leaves_every_allele_ungenotyped():
                     [(9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1"])])
         assert _counts(ev, "loci") == (1, 0, 0, 1, 1), _counts(ev, "loci")
         assert _counts(ev, "carrier") == (1, 0, 0, 1, 1), _counts(ev, "carrier")
-        assert _counts(ev, "noncarrier") == (1, 0, 0, 0, 1), _counts(ev, "noncarrier")
+        # the spurious record's non-carrier (S0) is a non-carrier FP; the locus's own non-carrier is still an FN
+        assert _counts(ev, "noncarrier") == (1, 0, 0, 1, 1), _counts(ev, "noncarrier")
     print("PASS test_a_missed_locus_leaves_every_allele_ungenotyped")
 
 
@@ -875,6 +876,20 @@ def test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps():
         row = ev.summary["by_event_type"]["INS"]["counts"]["loci"]
         assert row["fp"] is None and row["precision"] is None, row
     print("PASS test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps")
+
+
+def test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps():
+    """A spurious record genotypes every genome it names; its non-carriers are FPs of their own class too, so the
+    all-haplotype precision charges both classes."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"]),
+                     (9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"])])
+        assert _counts(ev, "carrier") == (1, 1, 1, 1, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (1, 1, 1, 1, 0), _counts(ev, "noncarrier")
+        assert _counts(ev, "all") == (2, 2, 2, 2, 0), _counts(ev, "all")
+    print("PASS test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps")
 
 
 def test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp():
@@ -1068,6 +1083,9 @@ def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
         assert exact["overall"]["n_recovered"] == 0
         assert exact["predictions"]["unmatched"] == 1
         assert exact["overall"]["carriers"]["tp"] == 0 and exact["overall"]["carriers"]["fn"] == 1
+        # the unpaired record still genotypes g1 as a non-carrier: a non-carrier FP once it describes no locus
+        assert exact["overall"]["counts"]["noncarrier"]["fp"] == 1, exact["overall"]["counts"]["noncarrier"]
+        assert ev.summary["overall"]["counts"]["noncarrier"]["fp"] == 0
         # the usual evaluation is untouched by the second one
         assert ev.summary["overall"]["carriers"]["tp"] == 1
         with open(os.path.join(d, "out.json")) as f:
@@ -1267,6 +1285,7 @@ if __name__ == "__main__":
     test_a_missing_genotype_is_an_fn_of_its_class_and_an_fp_of_neither()
     test_a_missed_locus_leaves_every_allele_ungenotyped()
     test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps()
+    test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps()
     test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp()
     test_a_genome_holding_a_neighbours_alt_of_a_multiallelic_call_is_not_a_carrier()
     test_an_alt_no_simulated_neighbour_explains_still_carries_the_event()

@@ -1204,16 +1204,24 @@ def aggregate(scored_events):
 def add_unmatched(counts, unmatched_records):
     '''
     Charge the calls that matched no simulated locus to the run's counts: each is a locus
-    FP, and each genome it calls a carrier a carrier FP. A displaced call is left out of
-    both -- its locus is already counted as recalled, and its genomes as not genotyped.
+    FP, each genome it calls a carrier a carrier FP, and each genome it genotypes as a
+    non-carrier a non-carrier FP -- a record that describes no simulated locus describes no
+    genome's allele there, whichever allele it gives. Before, its non-carriers were charged to
+    neither class, so the non-carrier row had no FPs by construction and the all-haplotype
+    precision counted non-carrier TPs but never a non-carrier FP. A displaced call is left out
+    of all three -- its locus is already counted as recalled, and its genomes as not genotyped.
     '''
     spurious = [r for r in unmatched_records if r.displaced_for is None]
     carriers = sum(1 for r in spurious for gt in r.gts.values() if pred_is_carrier(r, gt))
+    noncarriers = sum(1 for r in spurious for gt in r.gts.values()
+                      if any(a is not None for a in gt) and not pred_is_carrier(r, gt))
     counts["loci"]["fp"] = len(spurious)
     counts["loci"].update(with_rates(counts["loci"]))
     counts["carrier"]["fp"] += carriers
     counts["carrier"].update(with_rates(counts["carrier"]))
-    counts["all"]["fp"] += carriers
+    counts["noncarrier"]["fp"] += noncarriers
+    counts["noncarrier"].update(with_rates(counts["noncarrier"]))
+    counts["all"]["fp"] += carriers + noncarriers
     counts["all"].update(with_rates(counts["all"]))
 
 
@@ -1425,7 +1433,8 @@ def format_report(summary, meta, title="tevarsim Evaluate", preamble=()):
         lines.extend(_table(COUNT_HEADERS, count_rows(overall["counts"], unit)))
         lines.append(f"  a {unit} with no genotype (missed or displaced locus, or \".\") is an FN of "
                      "its own class and an FP of neither;")
-        lines.append("  the carriers of a call on no simulated locus are carrier FPs")
+        lines.append("  a call on no simulated locus charges every genome it genotypes: its carriers as carrier FPs, its "
+                     "non-carriers as non-carrier FPs")
         lines.append(f"  {unit} concordance: "
                      f"{genotypes['concordant']} / {genotypes['compared']} "
                      f"({_pct(genotypes['concordance'])})")
