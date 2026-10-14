@@ -1083,9 +1083,11 @@ def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
         assert exact["overall"]["n_recovered"] == 0
         assert exact["predictions"]["unmatched"] == 1
         assert exact["overall"]["carriers"]["tp"] == 0 and exact["overall"]["carriers"]["fn"] == 1
-        # the unpaired record still genotypes g1 as a non-carrier: a non-carrier FP once it describes no locus
-        assert exact["overall"]["counts"]["noncarrier"]["fp"] == 1, exact["overall"]["counts"]["noncarrier"]
-        assert ev.summary["overall"]["counts"]["noncarrier"]["fp"] == 0
+        # the call stays paired for its genomes: g0's allele is wrong (a carrier FN and FP), g1's REF is right
+        assert exact["overall"]["counts"]["carrier"]["fp"] == 1, exact["overall"]["counts"]["carrier"]
+        assert exact["overall"]["counts"]["noncarrier"]["tp"] == 1, exact["overall"]["counts"]["noncarrier"]
+        assert exact["overall"]["counts"]["noncarrier"]["fp"] == 0, exact["overall"]["counts"]["noncarrier"]
+        assert exact["overall"]["counts"]["loci"]["fp"] == 1, exact["overall"]["counts"]["loci"]
         # the usual evaluation is untouched by the second one
         assert ev.summary["overall"]["carriers"]["tp"] == 1
         with open(os.path.join(d, "out.json")) as f:
@@ -1094,6 +1096,26 @@ def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
         assert saved["summary_sequence_exact"]["overall"]["n_recovered"] == 0
         assert os.path.exists(os.path.join(d, "out.exact.json"))
     print("PASS test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence")
+
+def test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check():
+    """Every genotyped genome is compared, not only carriers: a non-carrier whose allele the call writes as something
+    other than its simulated sequence is caught, though its class (non-carrier) is right."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        pos, rid, r, alts, _, _ = _left_aligned_call(seq, ["1", "2"])
+        stray = r + "G"                                  # a 1-bp insertion the simulation never made
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [(pos, rid, r, alts + [stray], "ME_INFO=.,TY1,.", ["1", "2"])],
+                    reference=ref, carrier_info="ME_INFO")
+        assert ev.loci[0]["match"]["haplotype_identical"] is False
+        assert ev.loci[0]["match"]["genomes_not_identical"] == 1
+        assert _counts(ev, "noncarrier") == (1, 1, 1, 0, 0), "the usual scoring sees only the class"
+        exact = ev.exact_summary["overall"]["counts"]
+        assert (exact["noncarrier"]["tp"], exact["noncarrier"]["fp"], exact["noncarrier"]["fn"]) == (0, 1, 1), exact
+        assert exact["carrier"]["tp"] == 1, exact["carrier"]
+        assert (exact["loci"]["tp"], exact["loci"]["fp"], exact["loci"]["fn"]) == (0, 1, 1), exact["loci"]
+    print("PASS test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check")
+
 
 def test_one_wrong_base_inside_the_element_is_not_identical():
     with tempfile.TemporaryDirectory() as d:
@@ -1298,6 +1320,7 @@ if __name__ == "__main__":
     test_carrier_info_counts_an_excision_solo_ltr_as_the_event()
     test_a_call_anchored_before_the_tsd_is_haplotype_identical()
     test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence()
+    test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check()
     test_one_wrong_base_inside_the_element_is_not_identical()
     test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case()
     test_without_a_reference_nothing_changes()
