@@ -1447,6 +1447,41 @@ def test_a_genome_the_call_gives_ref_is_not_claimed_twice():
     print("PASS test_a_genome_the_call_gives_ref_is_not_claimed_twice")
 
 
+def test_a_genome_ref_in_both_at_a_reference_element_is_exact():
+    """A reference element excised in g0, and in g1 an insertion inside that element written as its own record: g1 is
+    REF in the element's record in both files, which is all either says about it."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        lo, hi = 5000, 11000                       # the reference element, REF = seq[lo-1:hi]
+        inner = lo + 60                            # within --max_dist of the element record, so a neighbour of it
+        exc = (lo, "EXC-chrT-5000-11000-LTR/Copia-TY1-FULL", seq[lo - 1:hi], [seq[lo - 1] + seq[lo:lo + 338]],
+               "TYPE=EXC;EVENTTYPE=EXC", ["1", "0"])
+        ins = (inner, "TY1-FULL#LTR/Copia_", seq[inner - 1], [seq[inner - 1] + ELEMENT + seq[inner - 5:inner]],
+               "TYPE=INS;EVENTTYPE=INS", ["0", "1"])
+        calls = [(lo, "exc", exc[2], exc[3], ".", ["1", "0"]), (inner, "ins", ins[2], ins[3], ".", ["0", "1"])]
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [exc, ins], ["g0", "g1"], calls, reference=ref)
+        assert [e["match"]["haplotype_identical"] for e in ev.loci] == [True, True], [e["match"] for e in ev.loci]
+    print("PASS test_a_genome_ref_in_both_at_a_reference_element_is_exact")
+
+
+def test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neighbours():
+    """A call whose REF is a whole reference element gives g1 the element with an insertion 3 kb inside it -- right,
+    though the insertion is far beyond --max_dist of either POS."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        lo, hi, inner = 5000, 11000, 8000
+        exc = (lo, "EXC-chrT-5000-11000-LTR/Copia-TY1-FULL", seq[lo - 1:hi], [seq[lo - 1] + seq[lo:lo + 338]],
+               "TYPE=EXC;EVENTTYPE=EXC", ["1", "0"])
+        ins = (inner, "TY1-FULL#LTR/Copia_", seq[inner - 1], [seq[inner - 1] + ELEMENT + seq[inner - 5:inner]],
+               "TYPE=INS;EVENTTYPE=INS", ["0", "1"])
+        with_ins = seq[lo - 1:inner] + ELEMENT + seq[inner - 5:inner] + seq[inner:hi]
+        call = (lo, "site", exc[2], [exc[3][0], with_ins], ".", ["1", "2"])
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [exc, ins], ["g0", "g1"], [call], reference=ref)
+        site = next(e for e in ev.loci if e["match"] and e["match"]["id"] == "site")
+        assert site["pos"] == lo and site["match"]["haplotype_identical"] is True, site["match"]
+    print("PASS test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neighbours")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1533,3 +1568,5 @@ if __name__ == "__main__":
     test_a_one_allele_record_takes_its_history_from_history()
     test_a_long_record_anchored_far_upstream_is_not_a_second_claim()
     test_a_genome_the_call_gives_ref_is_not_claimed_twice()
+    test_a_genome_ref_in_both_at_a_reference_element_is_exact()
+    test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neighbours()

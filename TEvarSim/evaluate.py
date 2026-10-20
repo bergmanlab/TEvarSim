@@ -781,6 +781,12 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), ba
             p_h = sorted(_window_haplotype(fasta, event.chrom, start, end, [(record.pos, record.ref, a)]) for a in p_al)
             out[tsample] = t_h == p_h
             continue
+        if all(a in (None, 0) for a in t_gt) and all(a in (None, 0) for a in p_gt):
+            # REF in both: each says this genome lacks the event, and that is all a GT 0 says (not this record's
+            # ALT). A neighbour the genome carries inside the REF span -- an insertion into a reference element whose
+            # record this is -- is scored at its own locus, not written in on one side only.
+            out[tsample] = True
+            continue
         r_lo, r_hi = record.pos, record.pos - 1 + len(record.ref)
         own = (record.pos, record.ref, p_al[0])
         # every other prediction record this genome has a variant at, overlapping the call: a different allele there
@@ -1794,14 +1800,27 @@ class Evaluator:
                 recs.sort(key=lambda r: r.pos)
             pred_pos = {c: [r.pos for r in recs] for c, recs in pred_spans.items()}
             longest = max((len(r.ref) for r in records), default=1)
+            # the simulated events a call's REF span could hold: --max_dist's neighbours are found by POS, and a call
+            # whose REF is a whole reference element holds events far more than --max_dist from either POS
+            truth_spans = {}
+            for e in events:
+                truth_spans.setdefault(e.chrom, []).append(e)
+            for evs in truth_spans.values():
+                evs.sort(key=lambda e: e.pos)
+            truth_pos = {c: [e.pos for e in evs] for c, evs in truth_spans.items()}
+            t_longest = max((len(e.ref) for e in events), default=1)
             for event, entry in zip(ordered, scored):
                 if entry["match"] is not None:
                     m = event.match
                     recs = pred_spans.get(m.chrom, [])
                     lo = bisect.bisect_left(pred_pos.get(m.chrom, []), m.pos - longest)
                     hi = bisect.bisect_right(pred_pos.get(m.chrom, []), m.pos + len(m.ref))
-                    checks = haplotype_checks(event, m, pairs, fasta, near.get(id(event), ()),
-                                              recs[lo:hi], background)
+                    evs = truth_spans.get(m.chrom, [])
+                    t_lo = bisect.bisect_left(truth_pos.get(m.chrom, []), m.pos - t_longest - NEIGHBOUR_SPAN_PAD)
+                    t_hi = bisect.bisect_right(truth_pos.get(m.chrom, []), m.pos + len(m.ref) + NEIGHBOUR_SPAN_PAD)
+                    within = [e for e in evs[t_lo:t_hi] if e.pos - 1 + len(e.ref) >= m.pos - NEIGHBOUR_SPAN_PAD]
+                    neighbours = list({id(n): n for n in list(near.get(id(event), ())) + within}.values())
+                    checks = haplotype_checks(event, m, pairs, fasta, neighbours, recs[lo:hi], background)
                     seq_checks[id(event)] = checks
                     entry["match"]["haplotype_identical"] = locus_verdict(checks)
                     entry["match"]["genomes_not_identical"] = sum(1 for v in checks.values() if v is False)
