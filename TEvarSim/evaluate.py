@@ -741,8 +741,11 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), ba
     one allele anchored before both sites). The other records of a stacked site -- the same POS, REF and alleles,
     one record per element -- are the same allele, not neighbours, so the edits they would add are the event's own.
 
-    A genome the prediction gives two overlapping, different alleles at the call (two records that both claim the
-    sequence there) is not its simulated sequence, whichever of them is right: applied together they cannot be.
+    A genome the prediction gives two overlapping, different alleles at the call -- another record anchored within
+    NEIGHBOUR_SPAN_PAD of it claiming the same bases, such as one insertion written both as an ALT of a multi-allelic
+    record and as a record of its own -- is not its simulated sequence, whichever of them is right: applied together
+    they cannot be. A record anchored farther away that spans the call (a long deletion or a whole-region allele) is
+    a call of its own, scored at its own locus, and is not charged here as well.
 
     ``background``, Simulate's background SNPs and small indels by contig (load_background), is written into the
     genome's sequence, and into the call's wherever the call's REF span does not cover it: a caller writes a
@@ -784,7 +787,7 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), ba
         # is a second claim on the same sequence
         clash = False
         for r in pred_near:
-            if r is record or r.chrom != record.chrom:
+            if r is record or r.chrom != record.chrom or abs(r.pos - record.pos) > NEIGHBOUR_SPAN_PAD:
                 continue
             r_gt = r.gts.get(psample, (None,))
             a = next((x for x in r_gt if x not in (None, 0)), None)

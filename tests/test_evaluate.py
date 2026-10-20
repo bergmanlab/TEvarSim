@@ -1415,6 +1415,21 @@ def test_a_one_allele_record_takes_its_history_from_history():
     print("PASS test_a_one_allele_record_takes_its_history_from_history")
 
 
+def test_a_long_record_anchored_far_upstream_is_not_a_second_claim():
+    """A deletion record anchored 2 kb upstream whose REF spans the call is another call, scored at its own locus:
+    the insertion call is not charged for it as well."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        p = TSD_POS
+        right = _left_aligned_call(seq, ["1", "0"])
+        wide = (p - 2000, "wide", seq[p - 2001:p + 100], [seq[p - 2001]], ".", ["1", "0"])
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [right, wide], reference=ref)
+        assert ev.loci[0]["match"]["id"] == "call1"
+        assert ev.loci[0]["match"]["haplotype_identical"] is True
+    print("PASS test_a_long_record_anchored_far_upstream_is_not_a_second_claim")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1499,3 +1514,4 @@ if __name__ == "__main__":
     test_a_background_snp_in_the_calls_allele_needs_background()
     test_mepresent_of_the_wrong_length_falls_back_to_the_genotype()
     test_a_one_allele_record_takes_its_history_from_history()
+    test_a_long_record_anchored_far_upstream_is_not_a_second_claim()
