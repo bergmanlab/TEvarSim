@@ -41,6 +41,8 @@ TRUTH_HEADER_INFO = (
     '##INFO=<ID=EVENTTYPE,Number=A,Type=String,Description="Event per ALT allele">\n'
     '##INFO=<ID=MEPRESENT,Number=A,Type=Integer,Description="Element present per ALT">\n'
     '##INFO=<ID=LTRLEN,Number=1,Type=Integer,Description="Solo LTR length">\n'
+    '##INFO=<ID=HISTORY,Number=1,Type=String,Description="Events along the ALT\'s ancestry">\n'
+    '##INFO=<ID=NESTED,Number=0,Type=Flag,Description="Landed inside another element">\n'
 )
 
 
@@ -1396,6 +1398,23 @@ def test_mepresent_of_the_wrong_length_falls_back_to_the_genotype():
     print("PASS test_mepresent_of_the_wrong_length_falls_back_to_the_genotype")
 
 
+def test_a_one_allele_record_takes_its_history_from_history():
+    """An end point cut down to its solo LTR: one allele, a net gain over REF, so no allele shows the excision --
+    HISTORY says what happened, and is what the record's history and event classes are."""
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, ["g0", "g1"],
+                    [(1000, "x", ANCHOR, [ANCHOR + SOLO_LTR], "TYPE=INS;EVENTTYPE=EXC;MEPRESENT=1;HISTORY=INS+EXC",
+                      ["1", "0"]),
+                     (2000, "y", ANCHOR, [ANCHOR + STACKED], "TYPE=INS;EVENTTYPE=INS;MEPRESENT=1;HISTORY=INS;NESTED",
+                      ["1", "0"])],
+                    ["g0", "g1"], [(1000, "c", ANCHOR, [ANCHOR + SOLO_LTR], ".", ["1", "0"])])
+        solo, nested = ev.loci
+        assert solo["history"] == "INS,EXC" and solo["event_classes"] == ["EXC", "INS"], solo
+        assert solo["unsupported_events"] == []
+        assert nested["history"] == "nested INS" and nested["event_classes"] == ["INS"], nested
+    print("PASS test_a_one_allele_record_takes_its_history_from_history")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1479,3 +1498,4 @@ if __name__ == "__main__":
     test_two_overlapping_calls_of_one_genome_are_not_sequence_exact()
     test_a_background_snp_in_the_calls_allele_needs_background()
     test_mepresent_of_the_wrong_length_falls_back_to_the_genotype()
+    test_a_one_allele_record_takes_its_history_from_history()

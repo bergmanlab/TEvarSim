@@ -248,7 +248,14 @@ def event_history(record, info):
     say anything about its history. A truth VCF straight out of ``Simulate`` writes one
     event per record, so the history is just the type; a backtracked lineage VCF merges an
     element's later history onto the same record and the history is where that shows up.
+
+    A record cut down to one allele of such a locus (the RO pilot's end points) cannot say its history across
+    alleles, and writes it instead: ``INFO/HISTORY`` (the events in order, "+"-joined) and the ``INFO/NESTED`` flag.
     '''
+    declared = declared_history(info)
+    if declared is not None:
+        label = ",".join(declared) or "-"
+        return f"nested {label}" if info.get("NESTED") else label
     n_alts = len(record.alts or ())
     raw_types = info.get("EVENTTYPE")
     if not raw_types:
@@ -269,6 +276,14 @@ def event_history(record, info):
     if present and not present[0]:
         label = f"nested {label}"
     return label
+
+
+def declared_history(info):
+    '''The events INFO/HISTORY declares, in order, or None where the record has no HISTORY.'''
+    raw = info.get("HISTORY")
+    if raw is None or raw == ".":
+        return None
+    return [t for t in str(raw).split("+") if t]
 
 
 def _as_tuple(value):
@@ -1180,7 +1195,13 @@ def score_event(event, pairs, tol, neighbours=(), seq_ok=None):
     scored["id"] = event.id
     scored["type"] = event.type
     scored["history"] = event.history
-    supported, unsupported = event_classes(event.alt_descs, event.alt_events, tol)
+    declared = declared_history(event.info)
+    if declared is not None:
+        # one allele cannot show the length change of each event behind it (an element inserted and excised to a solo
+        # LTR is a net gain over REF): the simulation's own history is the record's classes
+        supported, unsupported = set(declared), []
+    else:
+        supported, unsupported = event_classes(event.alt_descs, event.alt_events, tol)
     scored["event_classes"] = sorted(supported)
     scored["unsupported_events"] = unsupported
     scored["family"] = event.family
