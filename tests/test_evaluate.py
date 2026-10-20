@@ -1253,6 +1253,149 @@ def test_a_second_record_of_a_different_allele_stays_unmatched():
     print("PASS test_a_second_record_of_a_different_allele_stays_unmatched")
 
 
+# ---- stacked sites and nearby insertions ---------------------------------------
+#
+# A stacked site -- a host element with a younger one inside it -- is written one record per element, all with the
+# same POS, REF, alleles and genotypes; MEPRESENT says which alleles hold each record's element.
+
+INNER = "CTGA" * 1000              # a second, different element nested inside ELEMENT
+NEST_AT = 3000                     # where in ELEMENT it lands, with a 5-bp TSD of ELEMENT's own bases
+
+
+def _stacked_alleles(seq):
+    """(truth POS, REF, [host allele, host-with-inner allele]) at TSD_POS, the simulation's way."""
+    p = TSD_POS
+    tsd = seq[p - TSD_LEN:p]
+    host = ELEMENT
+    nested = ELEMENT[:NEST_AT] + INNER + ELEMENT[NEST_AT - TSD_LEN:NEST_AT] + ELEMENT[NEST_AT:]
+    return p, seq[p - 1], [seq[p - 1] + host + tsd, seq[p - 1] + nested + tsd]
+
+
+def _stacked_truth(seq, gts):
+    p, r, alts = _stacked_alleles(seq)
+    return [(p, "TY1-FULL#LTR/Copia_", r, alts, "TYPE=INS;EVENTTYPE=INS,INS;MEPRESENT=1,1", gts),
+            (p, "TY1-FULL#LTR/Copia_", r, alts, "TYPE=INS;EVENTTYPE=INS,INS;MEPRESENT=0,1", gts)]
+
+
+def _stacked_calls(seq, gts):
+    """miniME's way: the same two alleles anchored 4 bp before the truth POS (a 5-bp REF that ends on it), one record
+    per element, its carriers in ME_INFO -- the inner element's record first, so file order cannot pair them."""
+    p, _, alts = _stacked_alleles(seq)
+    pos, r = p - 4, seq[p - 5:p]
+    calls = [r[:-1] + a for a in alts]
+    return [(pos, "inner", r, calls, "ME_INFO=.,.,INNER", gts),
+            (pos, "host", r, calls, "ME_INFO=.,TY1,TY1", gts)]
+
+
+def test_a_stacked_sites_carriers_come_from_mepresent():
+    """g1 holds only the host and g2 both: the inner element's only carrier is g2, though g1's genotype is not REF."""
+    samples = ["g0", "g1", "g2"]
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        ev = _quiet(_evaluate, d, samples, _stacked_truth(seq, ["0", "1", "2"]),
+                    samples, _stacked_calls(seq, ["0", "1", "2"]), carrier_info="ME_INFO")
+        host, inner = sorted(ev.loci, key=lambda e: e["history"])
+        assert inner["history"] == "nested INS", inner["history"]
+        assert host["carriers"]["truth"] == ["g1", "g2"] and inner["carriers"]["truth"] == ["g2"]
+        assert host["match"]["id"] == "host" and inner["match"]["id"] == "inner"
+        assert inner["n_carrier_genomes"] == 1 and inner["allele_count"] == 1
+        assert _counts(ev, "all") == (6, 6, 6, 0, 0), _counts(ev, "all")
+    print("PASS test_a_stacked_sites_carriers_come_from_mepresent")
+
+
+def test_a_stacked_site_is_sequence_exact_when_its_alleles_are():
+    """The other record of a stacked site is the same allele, not a neighbour to write in a second time."""
+    samples = ["g0", "g1", "g2"]
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        ev = _quiet(_evaluate, d, samples, _stacked_truth(seq, ["0", "1", "2"]),
+                    samples, _stacked_calls(seq, ["0", "1", "2"]), carrier_info="ME_INFO", reference=ref)
+        assert [e["match"]["haplotype_identical"] for e in ev.loci] == [True, True]
+        exact = ev.exact_summary["overall"]["counts"]
+        assert (exact["loci"]["tp"], exact["loci"]["fp"], exact["loci"]["fn"]) == (2, 0, 0), exact["loci"]
+        assert (exact["all"]["tp"], exact["all"]["fp"], exact["all"]["fn"]) == (6, 0, 0), exact["all"]
+    print("PASS test_a_stacked_site_is_sequence_exact_when_its_alleles_are")
+
+
+OTHER = "TTGCA" * 1000             # a second insertion one base past the first
+
+
+def _two_sites(seq):
+    """Two insertions in one genome at TSD_POS and TSD_POS + 1, their 5-bp TSDs overlapping, and the one allele a
+    caller writes for both: REF the 5 bp ending on the first site."""
+    a, b = TSD_POS, TSD_POS + 1
+    first = (a, "TY1-FULL#LTR/Copia_", seq[a - 1], [seq[a - 1] + ELEMENT + seq[a - 5:a]], "TYPE=INS;EVENTTYPE=INS")
+    second = (b, "TY1-FULL#LTR/Copia_", seq[b - 1], [seq[b - 1] + OTHER + seq[b - 5:b]], "TYPE=INS;EVENTTYPE=INS")
+    both = ELEMENT + seq[a - 5:a] + seq[a] + OTHER + seq[a - 4:a]
+    call = (a - 4, "both", seq[a - 5:a], [seq[a - 5:a] + both], ".")
+    return first, second, call
+
+
+def test_one_call_for_two_insertions_a_base_apart_is_sequence_exact():
+    """The second site sits one base past the call's REF span, but the call's allele holds it: it is what the genome
+    has there, and the call's locus is exact."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        first, second, call = _two_sites(seq)
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [first + (["1", "0"],), second + (["1", "0"],)],
+                    ["g0", "g1"], [call + (["1", "0"],)], reference=ref)
+        matched = [e for e in ev.loci if e["match"] is not None]
+        assert len(matched) == 1 and matched[0]["pos"] == TSD_POS, ev.loci
+        assert matched[0]["match"]["haplotype_identical"] is True
+    print("PASS test_one_call_for_two_insertions_a_base_apart_is_sequence_exact")
+
+
+def test_two_overlapping_calls_of_one_genome_are_not_sequence_exact():
+    """A call right on its own is still wrong where another record gives the same genome a different allele over the
+    same bases: the two cannot both be its sequence."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        p = TSD_POS
+        right = _left_aligned_call(seq, ["1", "0"])
+        # farther from the truth POS than the right call, so it is not the one matched; its REF covers the right
+        # call's anchor base
+        again = (p - 7, "again", seq[p - 8:p - 4], [seq[p - 8:p - 4] + ELEMENT], ".", ["1", "0"])
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [right, again], reference=ref)
+        assert ev.loci[0]["match"]["id"] == "call1"
+        assert ev.loci[0]["match"]["haplotype_identical"] is False
+        assert ev.loci[0]["match"]["genomes_not_identical"] == 1      # g1 has neither
+    print("PASS test_two_overlapping_calls_of_one_genome_are_not_sequence_exact")
+
+
+def test_a_background_snp_in_the_calls_allele_needs_background():
+    """A background SNP in the TSD a call's REF covers: the genome has it, so a call writing it is right -- which only
+    --background can tell, since the truth VCF of mobile elements does not hold it."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        p = TSD_POS
+        snp_pos = p - 3                                   # 1-based, inside the 5-bp REF of the call below
+        base = seq[snp_pos - 1]
+        alt_base = "C" if base.upper() != "C" else "G"
+        r = seq[p - 5:p]
+        r_snp = r[:snp_pos - (p - 4)] + alt_base + r[snp_pos - (p - 4) + 1:]
+        call = (p - 4, "call", r, [r_snp + ELEMENT + seq[p - 5:p]], ".", ["1", "0"])
+        bg = os.path.join(d, "background.vcf")
+        _write_vcf(bg, ["g0", "g1"], [(snp_pos, "bgSNP", base, [alt_base], "TYPE=SNP", ["1", "0"])])
+        without = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])], ["g0", "g1"], [call],
+                         reference=ref)
+        assert without.loci[0]["match"]["haplotype_identical"] is False
+        with_bg = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])], ["g0", "g1"], [call],
+                         reference=ref, background=bg)
+        assert with_bg.loci[0]["match"]["haplotype_identical"] is True
+    print("PASS test_a_background_snp_in_the_calls_allele_needs_background")
+
+
+def test_mepresent_of_the_wrong_length_falls_back_to_the_genotype():
+    """One value per history step rather than per ALT cannot be read per allele: every non-REF genotype carries."""
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, ["g0", "g1"],
+                    [(1000, "x", ANCHOR, [ANCHOR + STACKED], "TYPE=INS;EVENTTYPE=INS,INS;MEPRESENT=0,1", ["1", "0"])],
+                    ["g0", "g1"], [(1000, "c", ANCHOR, [ANCHOR + STACKED], ".", ["1", "0"])])
+        assert ev.loci[0]["carriers"]["truth"] == ["g0"]
+    print("PASS test_mepresent_of_the_wrong_length_falls_back_to_the_genotype")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1330,3 +1473,9 @@ if __name__ == "__main__":
     test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited()
     test_a_second_record_sharing_a_carrier_stays_unmatched()
     test_a_second_record_of_a_different_allele_stays_unmatched()
+    test_a_stacked_sites_carriers_come_from_mepresent()
+    test_a_stacked_site_is_sequence_exact_when_its_alleles_are()
+    test_one_call_for_two_insertions_a_base_apart_is_sequence_exact()
+    test_two_overlapping_calls_of_one_genome_are_not_sequence_exact()
+    test_a_background_snp_in_the_calls_allele_needs_background()
+    test_mepresent_of_the_wrong_length_falls_back_to_the_genotype()

@@ -359,6 +359,11 @@ def main():
                          "differs is an FN of its true class and an FP of its called class, and a call wrong in any "
                          "genome is a miss at its locus and a locus FP. Written also to <outprefix>.exact.json and "
                          ".exact.html.")
+    Evaluate_parser.add_argument("--background", type=Existing_File_Path, default=None, metavar="VCF",
+                    help="With --reference: Simulate's <outprefix>.background.vcf (background SNPs and small indels). "
+                         "Written into each genome's simulated sequence for the sequence check, and into the call's "
+                         "outside its REF span, so a call that writes a background variant at its locus into its "
+                         "allele -- as the genome has it -- is not counted wrong. One haplotype per genome.")
     Evaluate_parser.add_argument("--carrier_info", type=str, default=None, metavar="KEY",
                     help="INFO field of the prediction that marks which ALTs are carrier alleles. With one "
                          "value per allele (REF first, e.g. miniME's ME_INFO, or ALTs only), an ALT whose value "
