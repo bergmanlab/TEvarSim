@@ -784,9 +784,10 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), ba
         r_lo, r_hi = record.pos, record.pos - 1 + len(record.ref)
         own = (record.pos, record.ref, p_al[0])
         # every other prediction record this genome has a variant at, overlapping the call: a different allele there
-        # is a second claim on the same sequence
+        # is a second claim on the same sequence. A genome the call gives REF is not claimed by it (GT 0 is "not this
+        # record's ALT"), so another record's variant there is that record's to answer for.
         clash = False
-        for r in pred_near:
+        for r in (pred_near if any(a not in (None, 0) for a in p_gt) else ()):
             if r is record or r.chrom != record.chrom or abs(r.pos - record.pos) > NEIGHBOUR_SPAN_PAD:
                 continue
             r_gt = r.gts.get(psample, (None,))

@@ -1430,6 +1430,23 @@ def test_a_long_record_anchored_far_upstream_is_not_a_second_claim():
     print("PASS test_a_long_record_anchored_far_upstream_is_not_a_second_claim")
 
 
+def test_a_genome_the_call_gives_ref_is_not_claimed_twice():
+    """A genome REF in the call and carrying another record's variant overlapping it (an excision anchored in the
+    call's TSD) has one claim on those bases, not two."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        p = TSD_POS
+        right = _left_aligned_call(seq, ["1", "0"])
+        other = (p - 3, "other", seq[p - 4:p + 10], [seq[p - 4]], ".", ["0", "1"])
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"]),
+                                                 (p - 3, "TY1-FULL#LTR/Copia_", seq[p - 4:p + 10], [seq[p - 4]],
+                                                  "TYPE=DEL;EVENTTYPE=DEL", ["0", "1"])],
+                    ["g0", "g1"], [right, other], reference=ref)
+        ins = next(e for e in ev.loci if e["match"] and e["match"]["id"] == "call1")
+        assert ins["match"]["haplotype_identical"] is True, ins["match"]
+    print("PASS test_a_genome_the_call_gives_ref_is_not_claimed_twice")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1515,3 +1532,4 @@ if __name__ == "__main__":
     test_mepresent_of_the_wrong_length_falls_back_to_the_genotype()
     test_a_one_allele_record_takes_its_history_from_history()
     test_a_long_record_anchored_far_upstream_is_not_a_second_claim()
+    test_a_genome_the_call_gives_ref_is_not_claimed_twice()
