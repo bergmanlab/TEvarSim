@@ -1482,6 +1482,27 @@ def test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neigh
     print("PASS test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neighbours")
 
 
+def test_a_variant_inside_a_genome_s_own_excision_is_described_twice():
+    """g1 excised the reference element; an insertion record inside it (g0's) gives g1 a 4-bp deletion there. g1 has
+    none of those bases, so the call writes them a second time: not exact. Giving g1 REF instead is right."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        lo, hi, inner = 5000, 11000, 5300
+        exc = (lo, "EXC-chrT-5000-11000-LTR/Copia-TY1-FULL", seq[lo - 1:hi], [seq[lo - 1] + seq[lo:lo + 338]],
+               "TYPE=EXC;EVENTTYPE=EXC", ["0", "1"])
+        ins = (inner, "TY1-FULL#LTR/Copia_", seq[inner - 1], [seq[inner - 1] + ELEMENT + seq[inner - 5:inner]],
+               "TYPE=INS;EVENTTYPE=INS", ["1", "0"])
+        site_r = seq[inner - 5:inner]
+        for g1_allele, expected in (("2", False), ("0", True)):
+            calls = [(lo, "exc", exc[2], exc[3], ".", ["0", "1"]),
+                     (inner - 4, "ins", site_r, [site_r + ELEMENT + seq[inner - 5:inner], site_r[0]], ".",
+                      ["1", g1_allele])]
+            ev = _quiet(_evaluate, d, ["g0", "g1"], [exc, ins], ["g0", "g1"], calls, reference=ref)
+            got = next(e for e in ev.loci if e["match"] and e["match"]["id"] == "ins")["match"]["haplotype_identical"]
+            assert got is expected, (g1_allele, got)
+    print("PASS test_a_variant_inside_a_genome_s_own_excision_is_described_twice")
+
+
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
     test_breakpoint_and_length_error_are_measured_per_event()
@@ -1570,3 +1591,4 @@ if __name__ == "__main__":
     test_a_genome_the_call_gives_ref_is_not_claimed_twice()
     test_a_genome_ref_in_both_at_a_reference_element_is_exact()
     test_insertions_deep_inside_a_reference_element_the_call_spans_are_its_neighbours()
+    test_a_variant_inside_a_genome_s_own_excision_is_described_twice()

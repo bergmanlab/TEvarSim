@@ -823,7 +823,12 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), ba
                 in_span.append((n.pos, n.ref, a))
         verdicts = []
         for carried in ([in_span, near] if near != in_span else [in_span]):
-            t_edits = [(event.pos, event.ref, t_al[0])] + sorted(set(carried))
+            # A genome REF at the event writes nothing there. Its REF written as an edit over the event's span would
+            # collide with an event of the genome's own that covers it (an excision of the reference element this site
+            # sits in), leaving nothing comparable, so a call giving the genome a variant inside bases it does not
+            # have went unchecked.
+            own_edit = [] if t_al[0] == event.ref else [(event.pos, event.ref, t_al[0])]
+            t_edits = own_edit + sorted(set(carried))
             p_edits = [own]
             start = max(0, min(e[0] for e in t_edits + p_edits) - 2)
             end = min(length, max(e[0] - 1 + len(e[1]) for e in t_edits + p_edits) + 1)
