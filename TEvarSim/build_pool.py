@@ -6,7 +6,7 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from .utils import (sample_TEins, bgSV, make_min_TE, take_stranded, layer_rng,
-                    LAYER_INS, LAYER_DEL, LAYER_EXC, description_tail, parse_tsd_tag)
+                    LAYER_INS, LAYER_DEL, LAYER_EXC, LAYER_POOL_MOD, description_tail, parse_tsd_tag)
 
 def is_dna(seq: Seq) -> bool:
     return set(str(seq)) <= set("ATGCN")
@@ -685,6 +685,11 @@ class TEPoolBuilder:
         self.polyA_ratio = args.polyA_ratio
         self.polyA_min = args.polyA_min
         self.polyA_max = args.polyA_max
+        # Classes (the part of 'name#class/superfamily' before the slash) whose elements may
+        # be given a poly-A tail or truncated; None = every class.
+        mod_classes = getattr(args, "mod_classes", None)
+        self.mod_classes = None if mod_classes is None else set(c for c in mod_classes.split(",") if c)
+        self.mod_rng = None
         # other
         self.random_seed = args.seed
         if self.random_seed is not None:
@@ -773,10 +778,18 @@ class TEPoolBuilder:
             3: lambda: self.INDEL_mutate().SNP_mutate().apply_truncate().apply_polyA()
         }
 
+        # Which elements are modified and which family each pool element is still come from
+        # the global stream, drawn whatever the ratios are, so that stream runs the same with
+        # modifications on or off. The modification lengths come from a stream per element
+        # (LAYER_POOL_MOD), so they shift nothing else either: a run that adds poly-A tails or
+        # truncation gets the same families, positions, SNPs and indels as one without.
         out_records = []
-        for j in mutate:
+        for i, j in enumerate(mutate):
             idx = np.random.randint(0, len(records))
             record = records[idx]
+            if self.mod_classes is not None and record.id.split("#")[1].split("/")[0] not in self.mod_classes:
+                j = 0
+            self.mod_rng = layer_rng(self.random_seed, LAYER_POOL_MOD, i)
             self.current_seq = list(str(record.seq))
             self.seqID_suffix = ""  # reset suffix each loop
             func_map[j]()
@@ -800,13 +813,13 @@ class TEPoolBuilder:
         max_trunc = int(len(self.current_seq) * self.truncated_max_length)
         if max_trunc < 1:
             return self
-        trunc_len = np.random.randint(1, max_trunc + 1)  # inclusive upper bound
+        trunc_len = int(self.mod_rng.integers(1, max_trunc + 1))  # inclusive upper bound
         self.current_seq = self.current_seq[trunc_len:]
         self.seqID_suffix += f"{trunc_len}truncate"
         return self
 
     def apply_polyA(self):
-        polyA_len = np.random.randint(self.polyA_min, self.polyA_max + 1)
+        polyA_len = int(self.mod_rng.integers(self.polyA_min, self.polyA_max + 1))
         self.current_seq.extend(["A"] * polyA_len)
         self.seqID_suffix += f"{polyA_len}polyA"
         return self

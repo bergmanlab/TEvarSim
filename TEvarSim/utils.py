@@ -67,6 +67,10 @@ def parse_tsd_tag(description: str, record_id: str = ""):
 # TErandom's layers, in the order they are made. The number is mixed into the seed, so it
 # names a stream; renumbering one changes what every run of that seed makes.
 LAYER_INS, LAYER_DEL, LAYER_EXC = 1, 2, 3
+# Not a layer of events but the pool's per-element modifications (poly-A tail and 5'
+# truncation lengths): one stream per pool element, so turning them on or off changes no
+# family choice, no position and no other element's sequence.
+LAYER_POOL_MOD = 6
 
 
 def layer_rng(seed, layer, *sub):

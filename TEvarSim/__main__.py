@@ -161,6 +161,10 @@ def main():
                     help="Minimum polyA tail length (default: 5)")
     TErandom_parser.add_argument("--polyA-max", "-X", type=int, default=20, 
                     help="Maximum polyA tail length (default: 20)")
+    TErandom_parser.add_argument("--mod-classes", default=None,
+                    help="Comma-separated classes (the 'class' of name#class/superfamily, e.g. "
+                         "LINE,SINE,Retroposon) whose elements may get a polyA tail or be truncated; "
+                         "elements of other classes never are (default: every class)")
     # Other
     TErandom_parser.add_argument("--seed", "-D", type=int, default=None, 
                     help="Random seed for reproducibility (default: None)")
