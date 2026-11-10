@@ -38,6 +38,7 @@ from collections import OrderedDict
 import pysam
 
 from .compare_vcf import (
+    Allele,
     calculate_metrics,
     convert_to_ploidy,
     genotype_agrees,
@@ -631,7 +632,7 @@ def carries_event(event, neighbours, tsample, p_descs):
             any(t.symbolic or t.size is None for t in event.alt_descs) or not event.alt_descs:
         return True                 # nothing comparable by length: every non-reference allele counts, as before
     for size in sizes:
-        sized = [t.size for t in event.alt_descs
+        sized = [t.size for t in comparable_descs(event)
                  if t.size and (size > 0) == (t.size > 0)
                  and abs(size - t.size) <= EVENT_ALT_LENGTH_FRACTION * abs(t.size)]
         if not sized:
@@ -668,58 +669,159 @@ def _haplotype(fasta, chrom, start, end, pos, ref, allele):
             + fasta.fetch(chrom, pos - 1 + len(ref), end)).upper()
 
 
-def haplotype_identical(event, match, pairs, fasta):
+def _window_haplotype(fasta, chrom, start, end, edits):
+    '''Reference [start, end) with every (pos, ref, alt) written in; None where two edits overlap.'''
+    out, cur = [], start
+    for pos, ref, alt in sorted(edits):
+        s = pos - 1
+        if s < cur:
+            return None
+        out += [fasta.fetch(chrom, cur, s), alt]
+        cur = s + len(ref)
+    if cur > end:
+        return None
+    out.append(fasta.fetch(chrom, cur, end))
+    return "".join(out).upper()
+
+
+def haplotype_checks(event, match, pairs, fasta, neighbours=()):
     '''
-    Is the called allele, written into the reference, base-for-base the simulated one?
+    For each paired genome at a matched locus, carrier or not: is the allele the call gives it, written into the
+    reference, base for base the sequence that genome has there in the simulation? {truth sample: True, False, or
+    None where nothing is comparable (no genotype in either file, a symbolic allele, a contig the reference lacks)}.
 
-    Evaluate otherwise compares alleles by net length only (``--gt_len_tol``), so a call of
-    the right size with the wrong sequence -- a TSD copy dropped, a junction misplaced, a
-    neighbour's allele -- passes. Comparing the haplotypes rather than the ALT strings is
-    what makes this fair across representations: an insertion with a TSD can be written at
-    any anchor along the duplicated bases (the simulation writes it after the TSD, a
-    left-aligning caller before it), and every such record yields the same haplotype.
-
-    Where both files call a genome a carrier, each such genome's non-reference alleles must
-    give the same haplotypes. Where no genome is a carrier in both, the locus passes if any
-    simulated allele and any called allele give the same haplotype. None when nothing is
-    comparable: a symbolic allele, or a contig the reference does not have.
+    Unlike haplotype_identical, which compared only genomes both files call carriers, every genotyped genome is
+    compared -- so a non-carrier whose allele the call writes wrongly (a deleted element's leftover TSD, say) is
+    caught. The genome's simulated sequence is this event's allele plus any nearby simulated event it carries: a
+    caller that writes a neighbour's insertion as another ALT of this record gives that genome the neighbour's
+    allele, which is right. Only neighbours inside the call's REF span count; one outside it is not part of what
+    this record describes. Background SNPs and small indels (Simulate's background VCF) are not read, so a call
+    that writes a genome's background variant into its allele is compared against a sequence without it.
     '''
     if match is None or event.chrom != match.chrom or event.chrom not in fasta.references:
-        return None
+        return {}
+
+    def allele(record, a):
+        seq = record.ref if a == 0 else record.alts[a - 1]
+        return None if seq.startswith("<") or seq in ("*", ".") else seq
+
     length = fasta.get_reference_length(event.chrom)
-    start = max(0, min(event.pos, match.pos) - 2)
-    end = min(length, max(event.pos - 1 + len(event.ref), match.pos - 1 + len(match.ref)) + 1)
-    cache = {}
-
-    def hap(record, allele):
-        key = (id(record), allele)
-        if key not in cache:
-            cache[key] = _haplotype(fasta, record.chrom, start, end, record.pos, record.ref, allele)
-        return cache[key]
-
-    def non_ref(descs, nonvariant=()):
-        if not descs:
-            return []
-        return [d for d in descs if d.idx != 0 and d.idx not in nonvariant]
-
-    compared = False
+    out = {}
     for tsample, psample in pairs:
-        t_descs = non_ref(event.descs.get(tsample))
-        p_descs = non_ref(match.descs.get(psample), match.nonvariant)
-        if not t_descs or not p_descs:
+        record = next((r for r in getattr(event, "split_duplicates", ())
+                       if pred_is_carrier(r, r.gts.get(psample, (None,)))), match)
+        t_gt, p_gt = event.gts.get(tsample, (None,)), record.gts.get(psample, (None,))
+        if all(a is None for a in t_gt) or all(a is None for a in p_gt):
+            out[tsample] = None
             continue
-        if any(d.symbolic for d in t_descs + p_descs):
-            return None
-        compared = True
-        if sorted(hap(event, d.seq) for d in t_descs) != sorted(hap(match, d.seq) for d in p_descs):
-            return False
-    if compared:
-        return True
-    t_alts = [d for d in event.alt_descs if not d.symbolic]
-    p_alts = [d for d in match.alt_descs if not d.symbolic and d.seq != "<*>"]
-    if not t_alts or not p_alts:
+        t_al = [allele(event, a) for a in t_gt if a is not None]
+        p_al = [allele(record, a) for a in p_gt if a is not None]
+        if None in t_al or None in p_al:
+            out[tsample] = None
+            continue
+        if len(t_al) != 1 or len(p_al) != 1:
+            # several haplotypes per genome: compared allele for allele, without neighbours
+            start = max(0, min(event.pos, record.pos) - 2)
+            end = min(length, max(event.pos - 1 + len(event.ref), record.pos - 1 + len(record.ref)) + 1)
+            t_h = sorted(_window_haplotype(fasta, event.chrom, start, end, [(event.pos, event.ref, a)]) for a in t_al)
+            p_h = sorted(_window_haplotype(fasta, event.chrom, start, end, [(record.pos, record.ref, a)]) for a in p_al)
+            out[tsample] = t_h == p_h
+            continue
+        carried = []
+        r_lo, r_hi = record.pos, record.pos - 1 + len(record.ref)
+        for n in neighbours:
+            n_gt = n.gts.get(tsample, (None,))
+            if n is event or n.chrom != event.chrom or not is_carrier(n_gt, {0}):
+                continue
+            # only a neighbour inside the call's REF span: elsewhere the call says nothing about it (the caller
+            # wrote it as a record of its own), so it is not part of what this record gives the genome
+            if n.pos - 1 + len(n.ref) < r_lo or n.pos > r_hi:
+                continue
+            a = allele(n, next(x for x in n_gt if x not in (None, 0)))
+            if a is not None:
+                carried.append((n.pos, n.ref, a))
+        t_edits = [(event.pos, event.ref, t_al[0])] + carried
+        p_edits = [(record.pos, record.ref, p_al[0])]
+        start = max(0, min(e[0] for e in t_edits + p_edits) - 2)
+        end = min(length, max(e[0] - 1 + len(e[1]) for e in t_edits + p_edits) + 1)
+        t_h = _window_haplotype(fasta, event.chrom, start, end, t_edits)
+        p_h = _window_haplotype(fasta, event.chrom, start, end, p_edits)
+        out[tsample] = None if t_h is None or p_h is None else t_h == p_h
+    return out
+
+
+def locus_verdict(checks):
+    '''A locus is sequence-exact when every comparable genome is; None when none is comparable.'''
+    vals = [v for v in checks.values() if v is not None]
+    if not vals:
         return None
-    return any(hap(event, t.seq) == hap(match, p.seq) for t in t_alts for p in p_alts)
+    return all(vals)
+
+
+# How far a simulated insertion may sit from an end of a simulated deletion and still be read as inserted at the junction
+# the deletion leaves: the insertion's TSD and the breakpoint jitter of either event.
+JUNCTION_TOL = 50
+
+
+def _carrier_genomes(event):
+    return {s for s, gt in event.gts.items() if is_carrier(gt, {0})}
+
+
+def link_junction_events(events, tol=JUNCTION_TOL):
+    '''
+    Mark each simulated insertion that sits at the junction a simulated deletion leaves, in genomes that all carry
+    that deletion.
+
+    In those genomes the deletion's two ends are one point, so the insertion is as much at the deletion's start as at
+    its end, and a caller can write the pair as one site anchored at the deletion's start: the deleted sequence
+    replaced by the inserted element, the ALT holding the net change. The simulation writes the insertion at the end
+    the deletion reached instead, a deletion's length away, so such a call scored as a missed insertion plus an
+    unmatched prediction, and the insertion's carriers as false negatives of the deletion (fly sim, pe41 fly_bgall2:
+    a Stalker4 at the end of a deleted gypsy4, a Transpac at the end of a deleted gypsy6).
+
+    So the insertion gets the deletion's other end as a second anchor, and both events take the replacement's net
+    length as one more allele a call may agree with, and, for the genomes carrying both, one more genotype. A call
+    written the simulation's way still matches exactly as before.
+    '''
+    dels = [e for e in events if e.type == "DEL" and e.size]
+    for ins in events:
+        if ins.type != "INS" or not ins.size:
+            continue
+        carriers = _carrier_genomes(ins)
+        if not carriers:
+            continue
+        for d in dels:
+            if d.chrom != ins.chrom:
+                continue
+            start, end = d.pos, d.pos - d.size          # a deletion's size is negative
+            if abs(ins.pos - end) <= tol:
+                other = start
+            elif abs(ins.pos - start) <= tol:
+                other = end
+            else:
+                continue
+            if not carriers <= _carrier_genomes(d):
+                continue
+            net = Allele(-1, ins.size + d.size, "", False)
+            ins.anchors = getattr(ins, "anchors", (ins.pos,)) + (other,)
+            for e in (ins, d):
+                e.junction_descs = getattr(e, "junction_descs", ()) + (net,)
+                gt_descs = e.__dict__.setdefault("junction_gt_descs", {})
+                for sample in carriers:
+                    descs = e.descs.get(sample)
+                    if descs is not None:
+                        gt_descs[sample] = tuple(net if a.idx != 0 else a for a in descs)
+
+
+def comparable_descs(event):
+    '''The event's alleles, with the net length of any junction replacement it is part of (link_junction_events).'''
+    return tuple(event.alt_descs) + tuple(getattr(event, "junction_descs", ()))
+
+
+def event_offset(record, event):
+    '''pred_offset from the nearer of the event's anchors: its POS, and for an insertion at a deletion's junction the
+    deletion's other end.'''
+    return min((pred_offset(record, a) for a in getattr(event, "anchors", (event.pos,))), key=abs)
 
 
 def match_events(events, records, max_dist, tol):
@@ -738,10 +840,10 @@ def match_events(events, records, max_dist, tol):
     candidates = []
     for i, event in enumerate(events):
         for j, record in enumerate(by_chrom.get(event.chrom, [])):
-            distance = abs(pred_offset(record, event.pos))
+            distance = abs(event_offset(record, event))
             if distance > max_dist:
                 continue
-            agree = alleles_overlap(event.alt_descs, record.alt_descs, tol)
+            agree = alleles_overlap(comparable_descs(event), record.alt_descs, tol)
             candidates.append((not agree, distance, i, event.chrom, j))
     candidates.sort()
     taken_events, taken_records = set(), set()
@@ -756,6 +858,49 @@ def match_events(events, records, max_dist, tol):
         # from a prediction back to the locus that claimed it as well as the other way.
         by_chrom[chrom][j].matched_for = events[i]
     match_displaced(events, by_chrom, taken_events, taken_records, max_dist, tol)
+    attach_split_duplicates(events, by_chrom, taken_records, max_dist, tol)
+
+
+def _pred_carriers(record):
+    return {s for s, gt in record.gts.items() if pred_is_carrier(record, gt)}
+
+
+def attach_split_duplicates(events, by_chrom, taken_records, max_dist, tol):
+    '''
+    Credit a matched event with a second record of the same allele that splits its carriers.
+
+    A caller that merges per-genome calls can leave one variant as two records: same site, same allele, the carrier
+    genomes divided between them (GraffiTE, after SURVIVOR's merge: fly sim bgall2 chr2R:8937805, two identical Tabor
+    records carried by 3 and 4 of the 7 genomes). The one-to-one matching pairs one record with the event, so the other
+    scored as an unmatched prediction, and its genomes twice over: as the event's false negatives and as false positives
+    of an unmatched call. The output is redundant, not wrong, so such a record is attached to the event instead:
+    within ``max_dist`` of it, an allele that agrees with the event's and with the matched record's, and carriers
+    disjoint from the matched record's and from any record already attached. Its genomes then count toward the event
+    as the matched record's would, and it is no longer an unmatched prediction; the summary counts these records apart.
+    A record sharing a carrier with the match is a competing claim, not a split, and stays unmatched.
+    '''
+    for event in events:
+        match = event.match
+        if match is None:
+            continue
+        claimed = _pred_carriers(match)
+        for j, record in enumerate(by_chrom.get(event.chrom, [])):
+            if record.matched or record.displaced_for is not None or (event.chrom, j) in taken_records:
+                continue
+            if abs(event_offset(record, event)) > max_dist:
+                continue
+            if not (alleles_overlap(comparable_descs(event), record.alt_descs, tol)
+                    and alleles_overlap(match.alt_descs, record.alt_descs, tol)):
+                continue
+            carriers = _pred_carriers(record)
+            if not carriers or carriers & claimed:
+                continue
+            claimed |= carriers
+            taken_records.add((event.chrom, j))
+            record.matched = True
+            record.matched_for = event
+            record.duplicate_of = match
+            event.split_duplicates = getattr(event, "split_duplicates", []) + [record]
 
 
 def ltr_shift(event):
@@ -850,15 +995,15 @@ def match_ploidy(t_gt, t_descs, p_gt, p_descs):
     return t_gt, t_descs, p_gt, p_descs
 
 
-def score_event(event, pairs, tol, neighbours=()):
-    '''Turn one simulated event and its matched prediction into a scored record.'''
+def score_event(event, pairs, tol, neighbours=(), seq_ok=None):
+    '''Turn one simulated event and its matched prediction into a scored record. seq_ok: the sequence-exact
+    scoring's per-genome verdicts (haplotype_checks); a genome whose allele is not its simulated sequence is
+    then an FN of its true class and an FP of the class it was called, even where the classes agree.'''
     match = event.match
     truth_carriers, pred_carriers = [], []
     tp = fp = fn = 0
     compared = concordant = 0
     by_class = OrderedDict((cls, _blank_counts()) for cls in ALLELE_CLASSES)
-    multi = match is not None and \
-        len([a for a in (match.alts or ()) if a != "<*>"]) > 1
     untyped = []
     no_site = []
     for tsample, psample in pairs:
@@ -875,26 +1020,35 @@ def score_event(event, pairs, tol, neighbours=()):
             p_carrier = False
             typed = False
         else:
-            p_gt = match.gts.get(psample, (None,))
-            p_carrier = pred_is_carrier(match, p_gt)
-            if p_carrier and multi and match.carrier_alts is None and not carries_event(event, neighbours, tsample,
-                                                         match.descs.get(psample)):
+            # A genome carried by a split duplicate (attach_split_duplicates) is read from that record.
+            record = next((r for r in getattr(event, "split_duplicates", ())
+                           if pred_is_carrier(r, r.gts.get(psample, (None,)))), match)
+            p_gt = record.gts.get(psample, (None,))
+            p_carrier = pred_is_carrier(record, p_gt)
+            record_multi = len([a for a in (record.alts or ()) if a != "<*>"]) > 1
+            if p_carrier and record_multi and record.carrier_alts is None and not carries_event(
+                    event, neighbours, tsample, record.descs.get(psample)):
                 p_carrier = False
             typed = any(a is not None for a in p_gt)
             if p_carrier:
                 pred_carriers.append(psample)
             # A genotype is only comparable where a prediction record describes the locus.
             wt_gt, wt_descs, wp_gt, wp_descs = match_ploidy(
-                t_gt, event.descs.get(tsample), p_gt, match.descs.get(psample))
+                t_gt, event.descs.get(tsample), p_gt, record.descs.get(psample))
             same = genotype_agrees(wt_descs, wp_descs, tol)
+            junction = getattr(event, "junction_gt_descs", {}).get(tsample)
+            if same is False and junction is not None:
+                _, jt_descs, _, jp_descs = match_ploidy(t_gt, junction, p_gt, record.descs.get(psample))
+                same = genotype_agrees(jt_descs, jp_descs, tol)
             if same is None:
                 same = sorted(a for a in wt_gt if a is not None) == \
                        sorted(a for a in wp_gt if a is not None)
             compared += 1
             concordant += bool(same)
-        tp += t_carrier and p_carrier
-        fp += (not t_carrier) and p_carrier
-        fn += t_carrier and (not p_carrier)
+        seq_bad = bool(seq_ok) and seq_ok.get(tsample) is False and typed
+        tp += t_carrier and p_carrier and not seq_bad
+        fp += p_carrier and (not t_carrier or seq_bad)
+        fn += t_carrier and (not p_carrier or seq_bad)
         # The same genome scored by allele class. A genome no correctly placed call
         # genotypes -- the locus was missed or displaced, or the call says "." -- has no
         # allele here at all: an FN of its own class and an FP of neither.
@@ -907,7 +1061,7 @@ def score_event(event, pairs, tol, neighbours=()):
             continue
         counts["genotyped"] += 1
         p_cls = "carrier" if p_carrier else "noncarrier"
-        if p_cls == t_cls:
+        if p_cls == t_cls and not seq_bad:
             counts["tp"] += 1
         else:
             counts["fn"] += 1
@@ -954,15 +1108,16 @@ def score_event(event, pairs, tol, neighbours=()):
     if match is None:
         scored["match"] = None
     else:
-        length_error = best_length_error(event.alt_descs, match.alt_descs)
+        length_error = best_length_error(comparable_descs(event), match.alt_descs)
         scored["match"] = OrderedDict([
             ("id", match.id),
             ("pos", match.pos),
-            ("pos_offset", pred_offset(match, event.pos)),
+            ("pos_offset", event_offset(match, event)),
             ("allele_bp", event_size(match.alt_descs)),
             ("length_error", length_error),
-            ("allele_match", alleles_overlap(event.alt_descs, match.alt_descs, tol)
+            ("allele_match", alleles_overlap(comparable_descs(event), match.alt_descs, tol)
                              if match.alt_descs else None),
+            ("split_duplicates", [r.id for r in getattr(event, "split_duplicates", ())]),
         ])
     scored["carriers"] = OrderedDict([
         ("truth", truth_carriers),
@@ -1113,16 +1268,24 @@ def aggregate(scored_events):
 def add_unmatched(counts, unmatched_records):
     '''
     Charge the calls that matched no simulated locus to the run's counts: each is a locus
-    FP, and each genome it calls a carrier a carrier FP. A displaced call is left out of
-    both -- its locus is already counted as recalled, and its genomes as not genotyped.
+    FP, each genome it calls a carrier a carrier FP, and each genome it genotypes as a
+    non-carrier a non-carrier FP -- a record that describes no simulated locus describes no
+    genome's allele there, whichever allele it gives. Before, its non-carriers were charged to
+    neither class, so the non-carrier row had no FPs by construction and the all-haplotype
+    precision counted non-carrier TPs but never a non-carrier FP. A displaced call is left out
+    of all three -- its locus is already counted as recalled, and its genomes as not genotyped.
     '''
     spurious = [r for r in unmatched_records if r.displaced_for is None]
     carriers = sum(1 for r in spurious for gt in r.gts.values() if pred_is_carrier(r, gt))
+    noncarriers = sum(1 for r in spurious for gt in r.gts.values()
+                      if any(a is not None for a in gt) and not pred_is_carrier(r, gt))
     counts["loci"]["fp"] = len(spurious)
     counts["loci"].update(with_rates(counts["loci"]))
     counts["carrier"]["fp"] += carriers
     counts["carrier"].update(with_rates(counts["carrier"]))
-    counts["all"]["fp"] += carriers
+    counts["noncarrier"]["fp"] += noncarriers
+    counts["noncarrier"].update(with_rates(counts["noncarrier"]))
+    counts["all"]["fp"] += carriers + noncarriers
     counts["all"].update(with_rates(counts["all"]))
 
 
@@ -1409,7 +1572,8 @@ def format_report(summary, meta, title="tevarsim Evaluate", preamble=()):
         lines.extend(_table(COUNT_HEADERS, count_rows(overall["counts"], unit)))
         lines.append(f"  a {unit} with no genotype (missed or displaced locus, or \".\") is an FN of "
                      "its own class and an FP of neither;")
-        lines.append("  the carriers of a call on no simulated locus are carrier FPs")
+        lines.append("  a call on no simulated locus charges every genome it genotypes: its carriers as carrier FPs, its "
+                     "non-carriers as non-carrier FPs")
         lines.append(f"  {unit} concordance: "
                      f"{genotypes['concordant']} / {genotypes['compared']} "
                      f"({_pct(genotypes['concordance'])})")
@@ -1513,6 +1677,8 @@ class Evaluator:
             ("matched", matched),
             ("unmatched", unmatched),
             ("displaced", n_displaced_calls),
+            # Matched records that are a second record of an event's allele (attach_split_duplicates).
+            ("split_duplicates", sum(1 for r in records if getattr(r, "duplicate_of", None) is not None)),
             ("precision", round(matched / len(records), 4) if records else None),
         ])
         # Counted per event class, not per record: an element inserted and later excised is
@@ -1573,6 +1739,7 @@ class Evaluator:
             convert_to_ploidy(self.truth_file, self.nHap, truth_file)
         events, truth_samples, truth_rows = load_truth_events(
             truth_file, self.INSonly, self.TEtype)
+        link_junction_events(events)
 
         if self.predType == "VCF":
             records, pred_samples, pred_rows = load_pred_vcf(self.pred_file, self.carrier_info)
@@ -1602,10 +1769,14 @@ class Evaluator:
         # simulated haplotype base for base? Recorded on every matched locus, and the basis of
         # the second, sequence-exact evaluation written after the usual one.
         fasta = self._open_reference()
+        seq_checks = {}
         if fasta is not None:
             for event, entry in zip(ordered, scored):
                 if entry["match"] is not None:
-                    entry["match"]["haplotype_identical"] = haplotype_identical(event, event.match, pairs, fasta)
+                    checks = haplotype_checks(event, event.match, pairs, fasta, near.get(id(event), ()))
+                    seq_checks[id(event)] = checks
+                    entry["match"]["haplotype_identical"] = locus_verdict(checks)
+                    entry["match"]["genomes_not_identical"] = sum(1 for v in checks.values() if v is False)
         summary, unmatched_records = self._summarize(scored, records, truth_samples)
 
         # With one allele per genome there is no genotype to get right beyond which
@@ -1677,27 +1848,49 @@ class Evaluator:
         # it unpairs the loci those outputs describe.
         exact_summary = exact_scored = exact_path = exact_html = None
         if fasta is not None:
+            # A call nothing could be compared on (symbolic alleles, say) is unpaired as before. A call compared and
+            # found wrong in some genome stays paired, so every genome is scored on its own sequence (score_event's
+            # seq_ok), but the locus is a miss and the call a locus FP: only a call right in every genome counts.
+            wrong = []
             for event, entry in zip(ordered, scored):
                 if event.displaced is not None:
                     event.displaced.displaced_for = None
                     event.displaced = None
-                if event.match is not None and not entry["match"].get("haplotype_identical"):
+                if event.match is None:
+                    continue
+                verdict = entry["match"].get("haplotype_identical")
+                if verdict is None:
                     event.match.matched = False
                     event.match.matched_for = None
                     event.match = None
-            exact_scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
+                elif verdict is False:
+                    wrong.append(id(event))
+            exact_scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()),
+                                        seq_ok=seq_checks.get(id(event)))
                             for event in ordered]
-            for entry, original in zip(exact_scored, scored):
+            for event, entry, original in zip(ordered, exact_scored, scored):
                 entry["locus_file"] = original.get("locus_file")
                 if entry["match"] is not None:
-                    entry["match"]["haplotype_identical"] = True
+                    entry["match"]["haplotype_identical"] = original["match"]["haplotype_identical"]
+                    entry["match"]["genomes_not_identical"] = original["match"]["genomes_not_identical"]
+                    if id(event) in wrong:
+                        entry["detected"] = entry["recovered"] = False
             exact_summary, exact_unmatched = self._summarize(exact_scored, records, truth_samples)
+            if wrong:
+                loci = exact_summary["overall"]["counts"]["loci"]
+                loci["fp"] = (loci["fp"] or 0) + len(wrong)
+                loci.update(with_rates(loci))
+                preds = exact_summary["predictions"]
+                preds["matched"] -= len(wrong)
+                preds["unmatched"] += len(wrong)
+                preds["precision"] = round(preds["matched"] / preds["total"], 4) if preds["total"] else None
             print(format_report(exact_summary, meta,
                                 title="tevarsim Evaluate -- sequence-exact (--reference)",
                                 preamble=[
-                                    "  as above, but a call counts only where its allele, written into the reference, is",
-                                    "  base-for-base the simulated haplotype; any other call is a miss at its locus and an",
-                                    f"  unmatched prediction. reference: {self.reference}"]))
+                                    "  as above, but every genotyped genome's allele, carrier or not, written into the",
+                                    "  reference, must be base-for-base its simulated haplotype: a genome that differs is an",
+                                    "  FN of its true class and an FP of its called class; a call wrong in any genome is a",
+                                    f"  miss at its locus and a locus FP. reference: {self.reference}"]))
             exact_path = f"{self.outprefix}.exact.json"
             with open(exact_path, "w") as fo:
                 json.dump(OrderedDict([("meta", meta), ("summary", exact_summary),

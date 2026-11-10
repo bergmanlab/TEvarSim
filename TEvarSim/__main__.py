@@ -406,11 +406,14 @@ def main():
                          "alleles as the same (default: 50)")
     Evaluate_parser.add_argument("--reference", "-R", type=Fasta_File_Path, default=None,
                     help="Reference FASTA the truth and prediction coordinates refer to (indexed, or in a "
-                         "writable directory). Adds a sequence check: each correctly placed call's allele is "
-                         "written into the reference and compared base-for-base (case-insensitive) with the "
-                         "simulated haplotype, so an anchor shifted along a TSD still matches. The usual report "
-                         "is followed by a second, sequence-exact one in which only identical calls count; it is "
-                         "also written to <outprefix>.exact.json and .exact.html.")
+                         "writable directory). Adds a sequence check: at each correctly placed call, every genotyped "
+                         "genome's allele -- carrier or not -- is written into the reference and compared "
+                         "base-for-base (case-insensitive) with that genome's simulated haplotype (this event plus "
+                         "any nearby simulated event it carries), so an anchor shifted along a TSD still matches. "
+                         "The usual report is followed by a second, sequence-exact one: a genome whose allele "
+                         "differs is an FN of its true class and an FP of its called class, and a call wrong in any "
+                         "genome is a miss at its locus and a locus FP. Written also to <outprefix>.exact.json and "
+                         ".exact.html.")
     Evaluate_parser.add_argument("--carrier_info", type=str, default=None, metavar="KEY",
                     help="INFO field of the prediction that marks which ALTs are carrier alleles. With one "
                          "value per allele (REF first, e.g. miniME's ME_INFO, or ALTs only), an ALT whose value "

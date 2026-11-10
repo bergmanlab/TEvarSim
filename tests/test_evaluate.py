@@ -857,7 +857,8 @@ def test_a_missed_locus_leaves_every_allele_ungenotyped():
                     [(9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1"])])
         assert _counts(ev, "loci") == (1, 0, 0, 1, 1), _counts(ev, "loci")
         assert _counts(ev, "carrier") == (1, 0, 0, 1, 1), _counts(ev, "carrier")
-        assert _counts(ev, "noncarrier") == (1, 0, 0, 0, 1), _counts(ev, "noncarrier")
+        # the spurious record's non-carrier (S0) is a non-carrier FP; the locus's own non-carrier is still an FN
+        assert _counts(ev, "noncarrier") == (1, 0, 0, 1, 1), _counts(ev, "noncarrier")
     print("PASS test_a_missed_locus_leaves_every_allele_ungenotyped")
 
 
@@ -875,6 +876,20 @@ def test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps():
         row = ev.summary["by_event_type"]["INS"]["counts"]["loci"]
         assert row["fp"] is None and row["precision"] is None, row
     print("PASS test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps")
+
+
+def test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps():
+    """A spurious record genotypes every genome it names; its non-carriers are FPs of their own class too, so the
+    all-haplotype precision charges both classes."""
+    samples = ["S0", "S1"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "0"])], samples,
+                    [(1000, "1.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"]),
+                     (9000, "2.1", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "0"])])
+        assert _counts(ev, "carrier") == (1, 1, 1, 1, 0), _counts(ev, "carrier")
+        assert _counts(ev, "noncarrier") == (1, 1, 1, 1, 0), _counts(ev, "noncarrier")
+        assert _counts(ev, "all") == (2, 2, 2, 2, 0), _counts(ev, "all")
+    print("PASS test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps")
 
 
 def test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp():
@@ -1068,6 +1083,11 @@ def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
         assert exact["overall"]["n_recovered"] == 0
         assert exact["predictions"]["unmatched"] == 1
         assert exact["overall"]["carriers"]["tp"] == 0 and exact["overall"]["carriers"]["fn"] == 1
+        # the call stays paired for its genomes: g0's allele is wrong (a carrier FN and FP), g1's REF is right
+        assert exact["overall"]["counts"]["carrier"]["fp"] == 1, exact["overall"]["counts"]["carrier"]
+        assert exact["overall"]["counts"]["noncarrier"]["tp"] == 1, exact["overall"]["counts"]["noncarrier"]
+        assert exact["overall"]["counts"]["noncarrier"]["fp"] == 0, exact["overall"]["counts"]["noncarrier"]
+        assert exact["overall"]["counts"]["loci"]["fp"] == 1, exact["overall"]["counts"]["loci"]
         # the usual evaluation is untouched by the second one
         assert ev.summary["overall"]["carriers"]["tp"] == 1
         with open(os.path.join(d, "out.json")) as f:
@@ -1076,6 +1096,26 @@ def test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence():
         assert saved["summary_sequence_exact"]["overall"]["n_recovered"] == 0
         assert os.path.exists(os.path.join(d, "out.exact.json"))
     print("PASS test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence")
+
+def test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check():
+    """Every genotyped genome is compared, not only carriers: a non-carrier whose allele the call writes as something
+    other than its simulated sequence is caught, though its class (non-carrier) is right."""
+    with tempfile.TemporaryDirectory() as d:
+        ref, seq = _reference(d)
+        pos, rid, r, alts, _, _ = _left_aligned_call(seq, ["1", "2"])
+        stray = r + "G"                                  # a 1-bp insertion the simulation never made
+        ev = _quiet(_evaluate, d, ["g0", "g1"], [_truth_ins(seq, ["1", "0"])],
+                    ["g0", "g1"], [(pos, rid, r, alts + [stray], "ME_INFO=.,TY1,.", ["1", "2"])],
+                    reference=ref, carrier_info="ME_INFO")
+        assert ev.loci[0]["match"]["haplotype_identical"] is False
+        assert ev.loci[0]["match"]["genomes_not_identical"] == 1
+        assert _counts(ev, "noncarrier") == (1, 1, 1, 0, 0), "the usual scoring sees only the class"
+        exact = ev.exact_summary["overall"]["counts"]
+        assert (exact["noncarrier"]["tp"], exact["noncarrier"]["fp"], exact["noncarrier"]["fn"]) == (0, 1, 1), exact
+        assert exact["carrier"]["tp"] == 1, exact["carrier"]
+        assert (exact["loci"]["tp"], exact["loci"]["fp"], exact["loci"]["fn"]) == (0, 1, 1), exact["loci"]
+    print("PASS test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check")
+
 
 def test_one_wrong_base_inside_the_element_is_not_identical():
     with tempfile.TemporaryDirectory() as d:
@@ -1106,6 +1146,112 @@ def test_without_a_reference_nothing_changes():
         assert ev.exact_summary is None
         assert not os.path.exists(os.path.join(d, "out.exact.json"))
     print("PASS test_without_a_reference_nothing_changes")
+
+# ---- an insertion at a deletion's junction ------------------------------------
+INSERTED = "CAT" * 1000                      # 3000 bp, a different element
+DEL_POS = 1000
+DEL_END = DEL_POS + len(ELEMENT)             # the deletion's last REF base
+
+
+def _junction_truth():
+    """A reference element deleted in S0-S2, and another inserted at the deletion's end in S2 alone."""
+    return [(DEL_POS, "DEL-chrT-1000-6929-LTR/Copia-TY1", ANCHOR + ELEMENT, [ANCHOR], "TYPE=DEL;EVENTTYPE=DEL",
+             ["1", "1", "1", "0"]),
+            (DEL_END + 2, "CAT1#LTR/Gypsy_", ANCHOR, [ANCHOR + INSERTED], "TYPE=INS;EVENTTYPE=INS",
+             ["0", "0", "1", "0"])]
+
+
+def test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found():
+    """A caller writes the pair as one site at the deletion's start, the inserted element replacing the deleted one,
+    one record per event: both events are detected, no call is left unmatched, and every carrier is credited."""
+    samples = ["S0", "S1", "S2", "S3"]
+    alts = [ANCHOR, ANCHOR + INSERTED]
+    gts = ["1", "1", "2", "0"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, _junction_truth(), samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, alts, ".", gts),
+                     (DEL_POS, "1.2", ANCHOR + ELEMENT, alts, ".", gts)])
+        overall = ev.summary["overall"]
+        assert overall["n_detected"] == 2, overall
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert overall["carriers"]["tp"] == 4 and overall["carriers"]["fn"] == 0 \
+            and overall["carriers"]["fp"] == 0, overall["carriers"]
+    print("PASS test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found")
+
+
+def test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before():
+    """The same pair written the simulation's way -- the deletion, and the insertion at its end -- still matches
+    each event to its own record."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, _junction_truth(), samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, [ANCHOR], ".", ["1", "1", "1", "0"]),
+                     (DEL_END + 2, "2.1", ANCHOR, [ANCHOR + INSERTED], ".", ["0", "0", "1", "0"])])
+        overall = ev.summary["overall"]
+        assert overall["n_detected"] == 2, overall
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert overall["carriers"]["tp"] == 4 and overall["carriers"]["fn"] == 0, overall["carriers"]
+        assert overall["genotypes"]["concordance"] == 1.0, overall["genotypes"]
+    print("PASS test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before")
+
+
+def test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved():
+    """Linked only where every carrier of the insertion carries the deletion: otherwise its two ends are not one
+    point in those genomes, and the replacement call does not find the insertion."""
+    samples = ["S0", "S1", "S2", "S3"]
+    truth = _junction_truth()
+    truth[1] = truth[1][:5] + (["0", "0", "1", "1"],)        # S3 has the insertion but not the deletion
+    alts = [ANCHOR, ANCHOR + INSERTED]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, truth, samples,
+                    [(DEL_POS, "1.1", ANCHOR + ELEMENT, alts, ".", ["1", "1", "2", "0"]),
+                     (DEL_POS, "1.2", ANCHOR + ELEMENT, alts, ".", ["1", "1", "2", "0"])])
+        assert ev.summary["overall"]["n_detected"] == 1, ev.summary["overall"]
+    print("PASS test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved")
+
+
+# ---- one variant left as two records -----------------------------------------
+
+
+def test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited():
+    """Two identical records at one site, carriers divided between them: both count toward the event, neither is an
+    unmatched prediction, and the summary counts the second as a split duplicate."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "0", "1", "0"])])
+        overall = ev.summary["overall"]
+        assert overall["carriers"]["tp"] == 3 and overall["carriers"]["fn"] == 0 \
+            and overall["carriers"]["fp"] == 0, overall["carriers"]
+        assert ev.summary["predictions"]["unmatched"] == 0, ev.summary["predictions"]
+        assert ev.summary["predictions"]["split_duplicates"] == 1, ev.summary["predictions"]
+    print("PASS test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited")
+
+
+def test_a_second_record_sharing_a_carrier_stays_unmatched():
+    """A record claiming a genome the matched record already carries is a competing call, not a split."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + ELEMENT], ".", ["0", "1", "1", "0"])])
+        assert ev.summary["predictions"]["unmatched"] == 1, ev.summary["predictions"]
+        assert ev.summary["predictions"]["split_duplicates"] == 0, ev.summary["predictions"]
+    print("PASS test_a_second_record_sharing_a_carrier_stays_unmatched")
+
+
+def test_a_second_record_of_a_different_allele_stays_unmatched():
+    """Another allele at the site is another call, whatever its carriers."""
+    samples = ["S0", "S1", "S2", "S3"]
+    with tempfile.TemporaryDirectory() as d:
+        ev = _quiet(_evaluate, d, samples, [_ins(1000, ["1", "1", "1", "0"])], samples,
+                    [(1000, "a", ANCHOR, [ANCHOR + ELEMENT], ".", ["1", "1", "0", "0"]),
+                     (1000, "b", ANCHOR, [ANCHOR + SOLO_LTR], ".", ["0", "0", "1", "0"])])
+        assert ev.summary["predictions"]["unmatched"] == 1, ev.summary["predictions"]
+        assert ev.summary["overall"]["carriers"]["fn"] == 1, ev.summary["overall"]["carriers"]
+    print("PASS test_a_second_record_of_a_different_allele_stays_unmatched")
+
 
 if __name__ == "__main__":
     test_every_event_is_scored_without_naming_a_genome()
@@ -1161,6 +1307,7 @@ if __name__ == "__main__":
     test_a_missing_genotype_is_an_fn_of_its_class_and_an_fp_of_neither()
     test_a_missed_locus_leaves_every_allele_ungenotyped()
     test_the_carriers_of_a_call_on_no_simulated_locus_are_carrier_fps()
+    test_the_noncarriers_of_a_call_on_no_simulated_locus_are_noncarrier_fps()
     test_a_displaced_call_is_recalled_but_genotypes_nothing_and_is_no_fp()
     test_a_genome_holding_a_neighbours_alt_of_a_multiallelic_call_is_not_a_carrier()
     test_an_alt_no_simulated_neighbour_explains_still_carries_the_event()
@@ -1173,6 +1320,13 @@ if __name__ == "__main__":
     test_carrier_info_counts_an_excision_solo_ltr_as_the_event()
     test_a_call_anchored_before_the_tsd_is_haplotype_identical()
     test_a_call_missing_a_tsd_copy_passes_on_length_but_not_on_sequence()
+    test_a_noncarrier_given_a_wrong_allele_fails_the_sequence_check()
     test_one_wrong_base_inside_the_element_is_not_identical()
     test_a_soft_masked_tsd_matches_the_same_bases_in_upper_case()
     test_without_a_reference_nothing_changes()
+    test_an_insertion_at_a_deletions_junction_written_as_a_replacement_is_found()
+    test_an_insertion_at_a_deletions_junction_written_as_two_events_scores_as_before()
+    test_an_insertion_beside_a_deletion_some_carriers_lack_is_not_moved()
+    test_a_second_record_of_the_same_allele_splitting_the_carriers_is_credited()
+    test_a_second_record_sharing_a_carrier_stays_unmatched()
+    test_a_second_record_of_a_different_allele_stays_unmatched()
