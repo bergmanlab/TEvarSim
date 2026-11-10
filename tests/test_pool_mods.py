@@ -72,6 +72,27 @@ def test_no_modifications_is_byte_identical_to_ratio_zero():
         assert open(out_a + ".fa").read() == open(out_b + ".fa").read()
 
 
+def test_simulate_gives_a_modified_insertion_the_same_carriers():
+    """Poly-A tails and truncation change an insertion's ALT, never its carriers or TSD."""
+    from test_layers import _tevarsim, _fixture
+    with tempfile.TemporaryDirectory() as d:
+        ref = _fixture(d)[0]
+        recs = []
+        for name, extra in (("off", ()), ("on", ("-A", 1, "-T", 1, "--mod-classes", "LINE"))):
+            out, _ = _pool(d, name, n_del=5, extra=extra + ("--nINS", 60))
+            _tevarsim("Simulate", "--ref", ref, "--bed", out + ".bed", "--pool", out + ".fa",
+                      "--num", 10, "--af-dist", "exponential", "--af-mean", 0.2, "--af-min", 0.1,
+                      "--allow-zero-carriers", "--tsd-from-header", "--seed", 7, "-O", out + "_sim")
+            with open(out + "_sim.vcf") as f:
+                rows = [l.rstrip("\n").split("\t") for l in f if not l.startswith("#")]
+            recs.append({(r[0], r[1], SUFFIX.sub("", r[2])): (r[4], r[9:]) for r in rows})
+        off, on = recs
+        assert set(off) == set(on), "a modification added or removed a record"
+        changed = [k for k in off if off[k][0] != on[k][0]]
+        assert changed and all("#LINE/" in k[2] for k in changed), changed
+        assert all(off[k][1] == on[k][1] for k in off), "a modification changed carriers"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

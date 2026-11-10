@@ -129,8 +129,18 @@ class Simulator:
     def _event_rng(self, event, purpose):
         """The random stream for one purpose of one event: the run's seed, the event's contig,
         span and ID, and the purpose, hashed together. The purpose keeps one draw from moving
-        another, so --num changes no TSD and --tsd-max no genotype."""
-        key = f'{event["chrom"]}\t{event["start"]}\t{event["end"]}\t{event["te_id"]}'.encode()
+        another, so --num changes no TSD and --tsd-max no genotype.
+
+        The ID is taken without its poly-A and truncation tokens ("_12truncate8polyA" -> "_"):
+        TErandom -A/-T change an element's sequence, not which event it is, so a run with poly-A
+        tails gives each insertion the carriers and TSD it has without them. An ID with no such
+        token is hashed exactly as before."""
+        te_id = event["te_id"]
+        if "_" in te_id:
+            head, mods = te_id.rsplit("_", 1)
+            if self._MODIFICATION_SUFFIX.fullmatch(mods):
+                te_id = head + "_" + self._LENGTH_MODIFICATION.sub("", mods)
+        key = f'{event["chrom"]}\t{event["start"]}\t{event["end"]}\t{te_id}'.encode()
         words = np.frombuffer(hashlib.sha256(key).digest()[:16], dtype=np.uint32).tolist()
         return np.random.default_rng([self._run_entropy, purpose, *words])
 
@@ -516,6 +526,7 @@ class Simulator:
                   f"({self.tsd_min}-{self.tsd_max}). Examples: {shown}{more}",file=sys.stderr)
     
     _MODIFICATION_SUFFIX = re.compile(r"(?:\d+(?:SNP|INDEL|polyA|truncate))*")
+    _LENGTH_MODIFICATION = re.compile(r"\d+(?:polyA|truncate)")
 
     def _parse_te_modification(self, te_id: str):
         """
