@@ -29,6 +29,7 @@ history -- so those rows total the events, and total more than the loci.
 Allele comparison, family parsing and the confusion-count arithmetic are shared with
 ``Compare`` so the two subcommands agree on what "the same allele" means.
 '''
+import bisect
 import json
 import os
 import re
@@ -78,6 +79,7 @@ class Locus:
         self.gts = gts              # truth sample -> GT tuple
         self.descs = descs          # truth sample -> resolved Allele tuple (or None)
         self.alt_descs = alt_descs  # every non-reference allele of the record
+        self.carrier_alts = None    # ALT indices holding this record's element (MEPRESENT); None: every ALT
         self.match = None           # the prediction record paired with this locus
         self.displaced = None       # a call that found it, but one solo LTR downstream
         self.index = None           # position in the truth file
@@ -248,7 +250,14 @@ def event_history(record, info):
     say anything about its history. A truth VCF straight out of ``Simulate`` writes one
     event per record, so the history is just the type; a backtracked lineage VCF merges an
     element's later history onto the same record and the history is where that shows up.
+
+    A record cut down to one allele of such a locus (the RO pilot's end points) cannot say its history across
+    alleles, and writes it instead: ``INFO/HISTORY`` (the events in order, "+"-joined) and the ``INFO/NESTED`` flag.
     '''
+    declared = declared_history(info)
+    if declared is not None:
+        label = ",".join(declared) or "-"
+        return f"nested {label}" if info.get("NESTED") else label
     n_alts = len(record.alts or ())
     raw_types = info.get("EVENTTYPE")
     if not raw_types:
@@ -271,6 +280,14 @@ def event_history(record, info):
     return label
 
 
+def declared_history(info):
+    '''The events INFO/HISTORY declares, in order, or None where the record has no HISTORY.'''
+    raw = info.get("HISTORY")
+    if raw is None or raw == ".":
+        return None
+    return [t for t in str(raw).split("+") if t]
+
+
 def _as_tuple(value):
     return value if isinstance(value, (tuple, list)) else (value,)
 
@@ -284,6 +301,31 @@ def event_size(alt_descs):
     if not sizes:
         return None
     return max(sizes, key=abs)
+
+
+def truth_carrier_alts(record, info):
+    '''
+    The ALTs that hold this record's own element, from INFO/MEPRESENT (Number=A): a set of 1-based ALT indices, or
+    None where every ALT does (no MEPRESENT, or one whose length is not the ALT count, so it cannot be read per allele).
+
+    A stacked locus is written as one record per element, all with the same alleles and genotypes, and a genome
+    whose allele lacks a record's element is not a carrier of that record however non-reference its genotype is.
+    '''
+    raw = info.get("MEPRESENT")
+    n_alts = len(record.alts or ())
+    if raw is None:
+        return None
+    values = _as_tuple(raw)
+    if len(values) != n_alts:
+        return None
+    return {i + 1 for i, v in enumerate(values) if v is not None and int(v) != 0}
+
+
+def truth_is_carrier(event, gt):
+    '''Does a genome with this genotype carry the truth record's element? Missing calls count as non-carriers.'''
+    if event.carrier_alts is None:
+        return is_carrier(gt, {0})
+    return any(a in event.carrier_alts for a in gt if a is not None)
 
 
 def load_truth_events(vcf_file, INSonly, TEtype):
@@ -305,6 +347,7 @@ def load_truth_events(vcf_file, INSonly, TEtype):
     seen_families = set()
     events = []
     rows = []
+    misshapen = {"EVENTTYPE": 0, "MEPRESENT": 0}
     for index, record in enumerate(vcf):
         varID = record.id or f"{record.chrom}:{record.pos}"
         info = dict(record.info)
@@ -332,12 +375,22 @@ def load_truth_events(vcf_file, INSonly, TEtype):
         event.type = etype
         event.history = event_history(record, info)
         event.alt_events = alt_event_types(record, info)
+        event.carrier_alts = truth_carrier_alts(record, info)
+        for key in misshapen:
+            if info.get(key) is not None and len(_as_tuple(info[key])) != len(record.alts or ()):
+                misshapen[key] += 1
         event.size = event_size(alt_descs)
         event.index = index
         event.text = text
         events.append(event)
         rows.append(VcfRow(index, record.chrom, record.pos, text, scored=event))
     link_hosts(events)
+    for key, n in misshapen.items():
+        if n:
+            # Both are Number=A. A list of another length (one value per history step, say) cannot be read per
+            # allele: EVENTTYPE is cut or padded to the ALTs, and carriers fall back to every non-reference genotype.
+            print(f"[WARNING] {vcf_file}: {n} record(s) have INFO/{key} with a value count other than their ALT "
+                  f"count; it is not read per allele there", file=sys.stderr)
     if wanted is not None and not any(f.casefold() == wanted for f in seen_families):
         raise ValueError(
             f"--TEtype '{TEtype}' matches no TE family in {vcf_file}. "
@@ -638,7 +691,7 @@ def carries_event(event, neighbours, tsample, p_descs):
         if not sized:
             continue
         mine = min(abs(size - s) for s in sized)
-        if not any(is_carrier(n.gts.get(tsample, (None,)), {0}) and
+        if not any(truth_is_carrier(n, n.gts.get(tsample, (None,))) and
                    (_closest(size, n.alt_descs) is not None and _closest(size, n.alt_descs) < mine)
                    for n in neighbours):
             return True
@@ -684,7 +737,13 @@ def _window_haplotype(fasta, chrom, start, end, edits):
     return "".join(out).upper()
 
 
-def haplotype_checks(event, match, pairs, fasta, neighbours=()):
+# How far outside a call's REF span a simulated neighbour the genome carries may sit and still be read as part of what
+# the call describes: two insertions whose target sites are a few bp apart, or overlap, are one allele to a caller,
+# which writes both elements into one ALT anchored at either site. Wider than any TSD, and well under --max_dist.
+NEIGHBOUR_SPAN_PAD = 50
+
+
+def haplotype_checks(event, match, pairs, fasta, neighbours=(), pred_near=(), background=None):
     '''
     For each paired genome at a matched locus, carrier or not: is the allele the call gives it, written into the
     reference, base for base the sequence that genome has there in the simulation? {truth sample: True, False, or
@@ -694,8 +753,21 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=()):
     compared -- so a non-carrier whose allele the call writes wrongly (a deleted element's leftover TSD, say) is
     caught. The genome's simulated sequence is this event's allele plus any nearby simulated event it carries: a
     caller that writes a neighbour's insertion as another ALT of this record gives that genome the neighbour's
-    allele, which is right. Only neighbours inside the call's REF span count; one outside it is not part of what
-    this record describes. Background SNPs and small indels (Simulate's background VCF) are not read, so a call
+    allele, which is right. Two readings of which neighbours the call describes are tried, and either matching is
+    enough: those inside the call's REF span (one written as its own record elsewhere is not part of this one), and
+    every carried neighbour within NEIGHBOUR_SPAN_PAD of it (two insertions a few bp apart, which a caller writes as
+    one allele anchored before both sites). The other records of a stacked site -- the same POS, REF and alleles,
+    one record per element -- are the same allele, not neighbours, so the edits they would add are the event's own.
+
+    A genome the prediction gives two overlapping, different alleles at the call -- another record anchored within
+    NEIGHBOUR_SPAN_PAD of it claiming the same bases, such as one insertion written both as an ALT of a multi-allelic
+    record and as a record of its own -- is not its simulated sequence, whichever of them is right: applied together
+    they cannot be. A record anchored farther away that spans the call (a long deletion or a whole-region allele) is
+    a call of its own, scored at its own locus, and is not charged here as well.
+
+    ``background``, Simulate's background SNPs and small indels by contig (load_background), is written into the
+    genome's sequence, and into the call's wherever the call's REF span does not cover it: a caller writes a
+    background variant at its locus into its allele, and leaves the rest to the background. Without it, a call
     that writes a genome's background variant into its allele is compared against a sequence without it.
     '''
     if match is None or event.chrom != match.chrom or event.chrom not in fasta.references:
@@ -727,26 +799,104 @@ def haplotype_checks(event, match, pairs, fasta, neighbours=()):
             p_h = sorted(_window_haplotype(fasta, event.chrom, start, end, [(record.pos, record.ref, a)]) for a in p_al)
             out[tsample] = t_h == p_h
             continue
-        carried = []
+        if all(a in (None, 0) for a in t_gt) and all(a in (None, 0) for a in p_gt):
+            # REF in both: each says this genome lacks the event, and that is all a GT 0 says (not this record's
+            # ALT). A neighbour the genome carries inside the REF span -- an insertion into a reference element whose
+            # record this is -- is scored at its own locus, not written in on one side only.
+            out[tsample] = True
+            continue
         r_lo, r_hi = record.pos, record.pos - 1 + len(record.ref)
+        own = (record.pos, record.ref, p_al[0])
+        # every other prediction record this genome has a variant at, overlapping the call: a different allele there
+        # is a second claim on the same sequence. A genome the call gives REF is not claimed by it (GT 0 is "not this
+        # record's ALT"), so another record's variant there is that record's to answer for.
+        clash = False
+        for r in (pred_near if any(a not in (None, 0) for a in p_gt) else ()):
+            if r is record or r.chrom != record.chrom or abs(r.pos - record.pos) > NEIGHBOUR_SPAN_PAD:
+                continue
+            r_gt = r.gts.get(psample, (None,))
+            a = next((x for x in r_gt if x not in (None, 0)), None)
+            if a is None or r.pos - 1 + len(r.ref) < r_lo or r.pos > r_hi:
+                continue
+            seq = allele(r, a)
+            if seq is not None and (r.pos, r.ref, seq) != own:
+                clash = True
+                break
+        if clash:
+            out[tsample] = False
+            continue
+        in_span, near = [], []
         for n in neighbours:
             n_gt = n.gts.get(tsample, (None,))
             if n is event or n.chrom != event.chrom or not is_carrier(n_gt, {0}):
                 continue
-            # only a neighbour inside the call's REF span: elsewhere the call says nothing about it (the caller
-            # wrote it as a record of its own), so it is not part of what this record gives the genome
-            if n.pos - 1 + len(n.ref) < r_lo or n.pos > r_hi:
-                continue
             a = allele(n, next(x for x in n_gt if x not in (None, 0)))
+            if a is None or (n.pos, n.ref, a) == (event.pos, event.ref, t_al[0]):
+                continue        # a symbolic allele, or a stacked sibling: the event's own allele again
+            n_lo, n_hi = n.pos, n.pos - 1 + len(n.ref)
+            if n_hi < r_lo - NEIGHBOUR_SPAN_PAD or n_lo > r_hi + NEIGHBOUR_SPAN_PAD:
+                continue
+            near.append((n.pos, n.ref, a))
+            if not (n_hi < r_lo or n_lo > r_hi):
+                in_span.append((n.pos, n.ref, a))
+        verdicts = []
+        for carried in ([in_span, near] if near != in_span else [in_span]):
+            # A genome REF at the event writes nothing there. Its REF written as an edit over the event's span would
+            # collide with an event of the genome's own that covers it (an excision of the reference element this site
+            # sits in), leaving nothing comparable, so a call giving the genome a variant inside bases it does not
+            # have went unchecked.
+            own_edit = [] if t_al[0] == event.ref else [(event.pos, event.ref, t_al[0])]
+            t_edits = own_edit + sorted(set(carried))
+            p_edits = [own]
+            start = max(0, min(e[0] for e in t_edits + p_edits) - 2)
+            end = min(length, max(e[0] - 1 + len(e[1]) for e in t_edits + p_edits) + 1)
+            bg = [b for b in background_edits(background, event.chrom, tsample, start, end)
+                  if not any(e[0] - 1 < b[0] - 1 + max(1, len(b[1])) and b[0] - 1 < e[0] - 1 + max(1, len(e[1]))
+                             for e in t_edits)] if background else []
+            p_bg = [b for b in bg if b[0] - 1 + len(b[1]) <= r_lo - 1 or b[0] - 1 >= r_hi]
+            t_h = _window_haplotype(fasta, event.chrom, start, end, t_edits + bg)
+            p_h = _window_haplotype(fasta, event.chrom, start, end, p_edits + p_bg)
+            if t_h is not None and p_h is not None:
+                verdicts.append(t_h == p_h)
+        out[tsample] = any(verdicts) if verdicts else None
+    return out
+
+
+def load_background(vcf_file, samples):
+    '''
+    Simulate's <outprefix>.background.vcf, for the sequence-exact check: {contig: (POS list, [(pos, ref, alts,
+    {sample: allele index})])} sorted by POS, keeping only the genomes the truth has. One haplotype per genome.
+    '''
+    vcf = pysam.VariantFile(vcf_file)
+    keep = [s for s in vcf.header.samples if s in set(samples)]
+    if not keep:
+        raise SystemExit(f"[ERROR] --background {vcf_file}: none of its samples are genomes of the truth VCF")
+    by_chrom = {}
+    for record in vcf:
+        gts = {}
+        for s in keep:
+            gt = record.samples[s].get("GT") or (None,)
+            a = next((x for x in gt if x not in (None, 0)), None)
             if a is not None:
-                carried.append((n.pos, n.ref, a))
-        t_edits = [(event.pos, event.ref, t_al[0])] + carried
-        p_edits = [(record.pos, record.ref, p_al[0])]
-        start = max(0, min(e[0] for e in t_edits + p_edits) - 2)
-        end = min(length, max(e[0] - 1 + len(e[1]) for e in t_edits + p_edits) + 1)
-        t_h = _window_haplotype(fasta, event.chrom, start, end, t_edits)
-        p_h = _window_haplotype(fasta, event.chrom, start, end, p_edits)
-        out[tsample] = None if t_h is None or p_h is None else t_h == p_h
+                gts[s] = a
+        if gts:
+            by_chrom.setdefault(record.chrom, []).append((record.pos, record.ref, tuple(record.alts or ()), gts))
+    return {c: ([r[0] for r in recs], recs) for c, recs in by_chrom.items()}
+
+
+def background_edits(background, chrom, sample, start, end):
+    '''The background variants a genome carries wholly inside reference [start, end), as (pos, ref, alt) edits.'''
+    if not background or chrom not in background:
+        return []
+    positions, recs = background[chrom]
+    i = bisect.bisect_left(positions, start + 1)
+    out = []
+    while i < len(recs) and recs[i][0] - 1 < end:
+        pos, ref, alts, gts = recs[i]
+        a = gts.get(sample)
+        if a is not None and pos - 1 + len(ref) <= end and not alts[a - 1].startswith("<"):
+            out.append((pos, ref, alts[a - 1]))
+        i += 1
     return out
 
 
@@ -764,7 +914,7 @@ JUNCTION_TOL = 50
 
 
 def _carrier_genomes(event):
-    return {s for s, gt in event.gts.items() if is_carrier(gt, {0})}
+    return {s for s, gt in event.gts.items() if truth_is_carrier(event, gt)}
 
 
 def link_junction_events(events, tol=JUNCTION_TOL):
@@ -824,15 +974,17 @@ def event_offset(record, event):
     return min((pred_offset(record, a) for a in getattr(event, "anchors", (event.pos,))), key=abs)
 
 
-def match_events(events, records, max_dist, tol):
+def match_events(events, records, max_dist, tol, pairs=()):
     '''
     Pair each simulated event with at most one prediction record, and vice versa.
 
     Every candidate pair within ``max_dist`` is scored, and the pairs are then taken in
-    order of preference: allele agreement first, breakpoint proximity second. The one-to-one
-    constraint is what keeps a stacked pair of elements honest -- two events at one locus
-    need two prediction records to both count as recovered, rather than both claiming the
-    single record that happens to sit there.
+    order of preference: allele agreement first, breakpoint proximity second, and third how
+    many paired genomes the two disagree on as carriers. The one-to-one constraint is what
+    keeps a stacked pair of elements honest -- two events at one locus need two prediction
+    records to both count as recovered, rather than both claiming the single record that
+    happens to sit there -- and the carriers are what tell its records apart: they share
+    their position and alleles, and differ only in which genomes hold each element.
     '''
     by_chrom = {}
     for record in records:
@@ -844,10 +996,12 @@ def match_events(events, records, max_dist, tol):
             if distance > max_dist:
                 continue
             agree = alleles_overlap(comparable_descs(event), record.alt_descs, tol)
-            candidates.append((not agree, distance, i, event.chrom, j))
+            disagree = sum(truth_is_carrier(event, event.gts.get(t, (None,))) !=
+                           pred_is_carrier(record, record.gts.get(p, (None,))) for t, p in pairs)
+            candidates.append((not agree, distance, disagree, i, event.chrom, j))
     candidates.sort()
     taken_events, taken_records = set(), set()
-    for _disagree, _distance, i, chrom, j in candidates:
+    for _disagree, _distance, _carriers, i, chrom, j in candidates:
         if i in taken_events or (chrom, j) in taken_records:
             continue
         taken_events.add(i)
@@ -1013,7 +1167,7 @@ def score_event(event, pairs, tol, neighbours=(), seq_ok=None):
             # so it is neither carrier nor non-carrier here. The host's locus scores that genome.
             no_site.append(tsample)
             continue
-        t_carrier = is_carrier(t_gt, {0})
+        t_carrier = truth_is_carrier(event, t_gt)
         if t_carrier:
             truth_carriers.append(tsample)
         if match is None:
@@ -1071,8 +1225,8 @@ def score_event(event, pairs, tol, neighbours=(), seq_ok=None):
     # truth VCF holds -- not only the ones that could be paired with a prediction.
     alleles = [a for gt in event.gts.values() for a in gt if a is not None]
     an = len(alleles)
-    ac = sum(1 for a in alleles if a != 0)
-    n_truth_carriers = sum(1 for gt in event.gts.values() if is_carrier(gt, {0}))
+    ac = sum(1 for a in alleles if a != 0 and (event.carrier_alts is None or a in event.carrier_alts))
+    n_truth_carriers = sum(1 for gt in event.gts.values() if truth_is_carrier(event, gt))
 
     scored = OrderedDict()
     scored["chrom"] = event.chrom
@@ -1080,7 +1234,13 @@ def score_event(event, pairs, tol, neighbours=(), seq_ok=None):
     scored["id"] = event.id
     scored["type"] = event.type
     scored["history"] = event.history
-    supported, unsupported = event_classes(event.alt_descs, event.alt_events, tol)
+    declared = declared_history(event.info)
+    if declared is not None:
+        # one allele cannot show the length change of each event behind it (an element inserted and excised to a solo
+        # LTR is a net gain over REF): the simulation's own history is the record's classes
+        supported, unsupported = set(declared), []
+    else:
+        supported, unsupported = event_classes(event.alt_descs, event.alt_events, tol)
     scored["event_classes"] = sorted(supported)
     scored["unsupported_events"] = unsupported
     scored["family"] = event.family
@@ -1658,6 +1818,7 @@ class Evaluator:
         self.nonmobilizing = load_nonmobilizing(self.nonmobilizing_file) if self.nonmobilizing_file else None
         self.background_sv_file = getattr(args, "background_sv", None)
         self.background_sv = load_background_sv(self.background_sv_file) if self.background_sv_file else None
+        self.background = getattr(args, "background", None)
 
     def _summarize(self, scored, records, truth_samples):
         '''Every summary table for one scoring of the loci; also returns the unmatched records.'''
@@ -1749,7 +1910,7 @@ class Evaluator:
         sample_map = read_sample_map(self.sample_map_file) if self.sample_map_file else None
         pairs, pairing = pair_samples(truth_samples, pred_samples, sample_map)
 
-        match_events(events, records, self.max_dist, self.gt_len_tol)
+        match_events(events, records, self.max_dist, self.gt_len_tol, pairs)
         ordered = sorted(events, key=lambda e: (e.chrom, e.pos))
         near = nearby_events(events, self.max_dist)
         scored = [score_event(event, pairs, self.gt_len_tol, near.get(id(event), ()))
@@ -1771,9 +1932,41 @@ class Evaluator:
         fasta = self._open_reference()
         seq_checks = {}
         if fasta is not None:
+            background = None
+            if self.background:
+                if self.nHap > 1:
+                    print(f"[WARNING] --background is read as one haplotype per genome; ignored with --nHap "
+                          f"{self.nHap}", file=sys.stderr)
+                else:
+                    background = load_background(self.background, truth_samples)
+            pred_spans = {}
+            for record in records:
+                pred_spans.setdefault(record.chrom, []).append(record)
+            for recs in pred_spans.values():
+                recs.sort(key=lambda r: r.pos)
+            pred_pos = {c: [r.pos for r in recs] for c, recs in pred_spans.items()}
+            longest = max((len(r.ref) for r in records), default=1)
+            # the simulated events a call's REF span could hold: --max_dist's neighbours are found by POS, and a call
+            # whose REF is a whole reference element holds events far more than --max_dist from either POS
+            truth_spans = {}
+            for e in events:
+                truth_spans.setdefault(e.chrom, []).append(e)
+            for evs in truth_spans.values():
+                evs.sort(key=lambda e: e.pos)
+            truth_pos = {c: [e.pos for e in evs] for c, evs in truth_spans.items()}
+            t_longest = max((len(e.ref) for e in events), default=1)
             for event, entry in zip(ordered, scored):
                 if entry["match"] is not None:
-                    checks = haplotype_checks(event, event.match, pairs, fasta, near.get(id(event), ()))
+                    m = event.match
+                    recs = pred_spans.get(m.chrom, [])
+                    lo = bisect.bisect_left(pred_pos.get(m.chrom, []), m.pos - longest)
+                    hi = bisect.bisect_right(pred_pos.get(m.chrom, []), m.pos + len(m.ref))
+                    evs = truth_spans.get(m.chrom, [])
+                    t_lo = bisect.bisect_left(truth_pos.get(m.chrom, []), m.pos - t_longest - NEIGHBOUR_SPAN_PAD)
+                    t_hi = bisect.bisect_right(truth_pos.get(m.chrom, []), m.pos + len(m.ref) + NEIGHBOUR_SPAN_PAD)
+                    within = [e for e in evs[t_lo:t_hi] if e.pos - 1 + len(e.ref) >= m.pos - NEIGHBOUR_SPAN_PAD]
+                    neighbours = list({id(n): n for n in list(near.get(id(event), ())) + within}.values())
+                    checks = haplotype_checks(event, m, pairs, fasta, neighbours, recs[lo:hi], background)
                     seq_checks[id(event)] = checks
                     entry["match"]["haplotype_identical"] = locus_verdict(checks)
                     entry["match"]["genomes_not_identical"] = sum(1 for v in checks.values() if v is False)
